@@ -147,10 +147,12 @@ contract DeployRatchetHookScript is Script {
         console.log("");
 
         // Step 3: Mine hook address
+        // protocolRecipient is the deployer
         bytes memory constructorArgs = abi.encode(
             IPoolManager(poolManager),
             predictedFactoryAddress,
-            DEFAULT_TEAM_FEE_SHARE
+            DEFAULT_TEAM_FEE_SHARE,
+            deployer
         );
 
         console.log("Step 3: Mining Hook Address...");
@@ -189,7 +191,8 @@ contract DeployRatchetHookScript is Script {
             IPositionManager(positionManager),
             IAllowanceTransfer(permit2),
             IWETH9(weth),
-            hook
+            hook,
+            deployer
         );
 
         require(address(factory) == predictedFactoryAddress, "Factory address mismatch!");

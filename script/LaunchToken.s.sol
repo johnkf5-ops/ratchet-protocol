@@ -64,7 +64,8 @@ contract LaunchTokenScript is Script {
             teamAllocationBps: teamAllocationBps,
             initialReactiveSellRate: initialReactiveSellRate,
             teamFeeShareBps: teamFeeShareBps,
-            initialSqrtPriceX96: initialSqrtPriceX96
+            initialSqrtPriceX96: initialSqrtPriceX96,
+            creator: ""
         });
 
         LaunchResult memory result = IRatchetFactory(FACTORY).launch{value: ethForLiquidity}(params);

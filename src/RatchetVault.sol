@@ -20,8 +20,13 @@ contract RatchetVault is IRatchetVault {
     address public immutable FACTORY;
     /// @notice The hook contract authorized to trigger reactive sells
     address public immutable HOOK;
+
     /// @notice The team address that receives ETH fees and controls the ratchet
-    address public immutable TEAM_RECIPIENT;
+    address private teamRecipient_;
+    /// @notice The creator identifier string
+    string public creator;
+    /// @notice Whether the vault has been claimed by its creator
+    bool public claimed;
 
     /// @notice The token this vault holds (set once by factory after token deployment)
     address public TOKEN;
@@ -38,6 +43,7 @@ contract RatchetVault is IRatchetVault {
     error NoFeesToClaim();
     error AlreadyInitialized();
     error ZeroAddress();
+    error NotYetClaimed();
 
     modifier onlyHook() {
         _checkHook();
@@ -54,26 +60,28 @@ contract RatchetVault is IRatchetVault {
     }
 
     function _checkTeam() internal view {
-        if (msg.sender != TEAM_RECIPIENT) revert OnlyTeam();
+        if (msg.sender != teamRecipient_) revert OnlyTeam();
     }
 
     /// @notice Deploy a new vault for a token launch
     /// @param hook_ The hook contract authorized to call onBuy
-    /// @param teamRecipient_ Address that can decrease rate and claim fees
+    /// @param teamRecipient__ Address that can decrease rate and claim fees
     /// @param initialReactiveSellRate_ Starting sell rate in bps (max 1000 = 10%)
+    /// @param creator_ Creator identifier string
     constructor(
         address hook_,
-        address teamRecipient_,
-        uint256 initialReactiveSellRate_
+        address teamRecipient__,
+        uint256 initialReactiveSellRate_,
+        string memory creator_
     ) {
         if (hook_ == address(0)) revert ZeroAddress();
-        if (teamRecipient_ == address(0)) revert ZeroAddress();
         if (initialReactiveSellRate_ > MAX_REACTIVE_SELL_RATE) revert RateTooHigh();
 
         FACTORY = msg.sender;
         HOOK = hook_;
-        TEAM_RECIPIENT = teamRecipient_;
+        teamRecipient_ = teamRecipient__;
         reactiveSellRate = initialReactiveSellRate_;
+        creator = creator_;
     }
 
     /// @notice Initialize the token address (called by factory after token deployment)
@@ -111,6 +119,7 @@ contract RatchetVault is IRatchetVault {
     /// @notice Decrease the reactive sell rate. Can only go down, never up.
     /// @param newRate New rate in basis points, must be strictly less than current
     function decreaseRate(uint256 newRate) external onlyTeam {
+        if (!claimed) revert NotYetClaimed();
         if (newRate >= reactiveSellRate) revert RateCanOnlyDecrease();
 
         uint256 oldRate = reactiveSellRate;
@@ -121,15 +130,27 @@ contract RatchetVault is IRatchetVault {
 
     /// @notice Withdraw accumulated ETH fees to team recipient
     function claimFees() external onlyTeam {
+        if (!claimed) revert NotYetClaimed();
         uint256 fees = accumulatedFees;
         if (fees == 0) revert NoFeesToClaim();
 
         accumulatedFees = 0;
 
-        (bool success,) = TEAM_RECIPIENT.call{value: fees}("");
+        (bool success,) = teamRecipient_.call{value: fees}("");
         require(success, "ETH transfer failed");
 
-        emit TeamFeeClaimed(TEAM_RECIPIENT, fees);
+        emit TeamFeeClaimed(teamRecipient_, fees);
+    }
+
+    /// @notice Set the vault as claimed with a new team recipient
+    /// @dev Only callable by the factory contract
+    /// @param newRecipient The new team recipient address
+    function setClaimed(address newRecipient) external {
+        if (msg.sender != FACTORY) revert OnlyFactory();
+        teamRecipient_ = newRecipient;
+        claimed = true;
+
+        emit CreatorClaimed(address(this), newRecipient);
     }
 
     /// @notice Receive ETH fees from hook
@@ -147,8 +168,8 @@ contract RatchetVault is IRatchetVault {
         return HOOK;
     }
 
-    /// @notice Get the team recipient address (legacy getter)
+    /// @notice Get the team recipient address
     function teamRecipient() external view returns (address) {
-        return TEAM_RECIPIENT;
+        return teamRecipient_;
     }
 }

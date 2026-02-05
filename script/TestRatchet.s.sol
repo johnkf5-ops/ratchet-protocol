@@ -17,7 +17,7 @@ contract TestRatchetScript is Script {
         console.log("=== Testing Ratchet Mechanism ===");
         console.log("");
         console.log("Vault:", VAULT);
-        console.log("Team Recipient:", vault.TEAM_RECIPIENT());
+        console.log("Team Recipient:", vault.teamRecipient());
         console.log("");
 
         // Step 1: Read current rate

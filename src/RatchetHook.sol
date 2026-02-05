@@ -28,11 +28,17 @@ contract RatchetHook is BaseHook, IRatchetHook {
     using SafeCast for int256;
 
     uint256 public constant BPS_DENOMINATOR = 10000;
+    uint256 public constant PROTOCOL_FEE_BPS = 2000; // 20%
 
     /// @notice Factory that deployed this hook, only factory can register pools
     address public immutable FACTORY;
+    /// @notice Protocol fee recipient address
+    address public immutable PROTOCOL_RECIPIENT;
     /// @notice Team's share of ETH fees in basis points (e.g., 500 = 5%)
     uint256 public teamFeeShare;
+
+    /// @notice Accumulated protocol fees available for claiming
+    uint256 public protocolFeesAccumulated;
 
     /// @notice Maps pool ID to its associated vault
     mapping(bytes32 => address) public poolVaults;
@@ -44,11 +50,17 @@ contract RatchetHook is BaseHook, IRatchetHook {
     mapping(bytes32 => uint256) public poolEthFees;
 
     error OnlyFactory();
+    error OnlyProtocol();
     error PoolAlreadyInitialized();
     error PoolNotInitialized();
 
     modifier onlyFactory() {
         _checkFactory();
+        _;
+    }
+
+    modifier onlyProtocol() {
+        if (msg.sender != PROTOCOL_RECIPIENT) revert OnlyProtocol();
         _;
     }
 
@@ -60,11 +72,13 @@ contract RatchetHook is BaseHook, IRatchetHook {
     /// @param poolManager_ Uniswap v4 pool manager
     /// @param factory_ Factory contract authorized to register pools
     /// @param defaultTeamFeeShare_ Default team fee share in basis points
-    constructor(IPoolManager poolManager_, address factory_, uint256 defaultTeamFeeShare_)
+    /// @param protocolRecipient_ Address that receives protocol fees
+    constructor(IPoolManager poolManager_, address factory_, uint256 defaultTeamFeeShare_, address protocolRecipient_)
         BaseHook(poolManager_)
     {
         FACTORY = factory_;
         teamFeeShare = defaultTeamFeeShare_;
+        PROTOCOL_RECIPIENT = protocolRecipient_;
     }
 
     /// @notice Register a new pool with its vault. Called by factory during launch.
@@ -176,7 +190,7 @@ contract RatchetHook is BaseHook, IRatchetHook {
     }
 
     /// @notice Distribute accumulated fees for a specific pool
-    /// @dev Sends teamFeeShare% of tracked ETH fees to vault, donates tokens to LP
+    /// @dev Takes 20% protocol fee first, then sends teamFeeShare% of remaining to vault, donates tokens to LP
     /// @param key The pool to route fees for
     function routeFees(PoolKey calldata key) external {
         bytes32 poolId = PoolId.unwrap(key.toId());
@@ -189,12 +203,18 @@ contract RatchetHook is BaseHook, IRatchetHook {
             // Clear balance before transfer to prevent reentrancy
             poolEthFees[poolId] = 0;
 
-            uint256 toTeam = (ethFees * teamFeeShare) / BPS_DENOMINATOR;
+            // Protocol takes 20% off the top
+            uint256 protocolFee = (ethFees * PROTOCOL_FEE_BPS) / BPS_DENOMINATOR;
+            protocolFeesAccumulated += protocolFee;
+
+            // Remaining 80% is split between team and hook
+            uint256 remaining = ethFees - protocolFee;
+            uint256 toTeam = (remaining * teamFeeShare) / BPS_DENOMINATOR;
             if (toTeam > 0) {
                 (bool success,) = vault.call{value: toTeam}("");
                 require(success, "ETH transfer failed");
             }
-            // Note: remaining ETH (ethFees - toTeam) stays in contract as protocol revenue
+            // Note: remaining ETH (remaining - toTeam) stays in contract as LP revenue
             // or could be donated back to LP in a future implementation
         }
 
@@ -208,6 +228,18 @@ contract RatchetHook is BaseHook, IRatchetHook {
         }
 
         emit FeesRouted(ethFees * teamFeeShare / BPS_DENOMINATOR, tokenFees);
+    }
+
+    /// @notice Claim accumulated protocol fees
+    /// @dev Only callable by PROTOCOL_RECIPIENT. Transfers all accumulated protocol fees.
+    function claimProtocolFees() external onlyProtocol {
+        uint256 amount = protocolFeesAccumulated;
+        protocolFeesAccumulated = 0;
+
+        (bool success,) = PROTOCOL_RECIPIENT.call{value: amount}("");
+        require(success, "ETH transfer failed");
+
+        emit ProtocolFeeClaimed(PROTOCOL_RECIPIENT, amount);
     }
 
     /// @notice Accept ETH but require explicit pool association via depositFees

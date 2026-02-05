@@ -5,6 +5,7 @@ interface IRatchetVault {
     event ReactiveSell(address indexed buyer, uint256 buyAmount, uint256 sellAmount, uint256 newRate);
     event RatchetDecreased(uint256 oldRate, uint256 newRate);
     event TeamFeeClaimed(address indexed recipient, uint256 amount);
+    event CreatorClaimed(address indexed vault, address indexed newOwner);
 
     /// @notice Current reactive sell rate in basis points (0-1000 = 0-10%)
     function reactiveSellRate() external view returns (uint256);
@@ -20,4 +21,11 @@ interface IRatchetVault {
 
     /// @notice Claim accumulated ETH fees
     function claimFees() external;
+
+    /// @notice Set the vault as claimed with a new team recipient (only factory)
+    /// @param newRecipient The new team recipient address
+    function setClaimed(address newRecipient) external;
+
+    /// @notice The creator string associated with this vault
+    function creator() external view returns (string memory);
 }

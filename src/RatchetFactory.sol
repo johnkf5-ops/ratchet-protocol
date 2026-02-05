@@ -48,6 +48,8 @@ contract RatchetFactory is IRatchetFactory {
     IAllowanceTransfer public immutable PERMIT2;
     /// @notice Wrapped ETH contract on this chain
     IWETH9 public immutable WETH;
+    /// @notice Verifier address authorized to call verifyClaim
+    address public immutable VERIFIER;
 
     /// @notice Default swap fee (1%)
     uint24 public constant DEFAULT_FEE = 10000;
@@ -61,8 +63,8 @@ contract RatchetFactory is IRatchetFactory {
     error ReactiveSellRateTooHigh();
     error InsufficientETH();
     error RefundFailed();
-
     error InvalidHook();
+    error OnlyVerifier();
 
     /// @notice Deploy the factory with a pre-deployed hook
     /// @dev The hook must be deployed at a mined address with correct permission flags.
@@ -72,12 +74,14 @@ contract RatchetFactory is IRatchetFactory {
     /// @param permit2_ Permit2 address for token approvals
     /// @param weth_ WETH address on this chain
     /// @param hook_ Pre-deployed RatchetHook at a mined address
+    /// @param verifier_ Address authorized to verify creator claims
     constructor(
         IPoolManager poolManager_,
         IPositionManager positionManager_,
         IAllowanceTransfer permit2_,
         IWETH9 weth_,
-        RatchetHook hook_
+        RatchetHook hook_,
+        address verifier_
     ) {
         // Validate hook has correct permissions encoded in address
         if (address(hook_) == address(0)) revert InvalidHook();
@@ -88,6 +92,7 @@ contract RatchetFactory is IRatchetFactory {
         PERMIT2 = permit2_;
         WETH = weth_;
         HOOK = hook_;
+        VERIFIER = verifier_;
 
         // Approve Permit2 to spend WETH (unlimited, one-time setup)
         IERC20(address(weth_)).approve(address(permit2_), type(uint256).max);
@@ -122,7 +127,7 @@ contract RatchetFactory is IRatchetFactory {
         ));
 
         // Compute vault address using CREATE2 (vault doesn't need token in constructor)
-        address vaultAddress = _computeCreate2Address(salt, params.initialReactiveSellRate, msg.sender);
+        address vaultAddress = _computeCreate2Address(salt, params.initialReactiveSellRate, msg.sender, params.creator);
 
         // Deploy token - mints LP portion here, team portion to vault address
         RatchetToken token = new RatchetToken(
@@ -138,12 +143,18 @@ contract RatchetFactory is IRatchetFactory {
         RatchetVault vault = new RatchetVault{salt: salt}(
             address(HOOK),
             msg.sender,
-            params.initialReactiveSellRate
+            params.initialReactiveSellRate,
+            params.creator
         );
         require(address(vault) == vaultAddress, "Vault address mismatch");
 
         // Initialize vault with token address
         vault.initialize(address(token));
+
+        // Auto-claim if no creator string (direct launch)
+        if (bytes(params.creator).length == 0) {
+            vault.setClaimed(msg.sender);
+        }
 
         // Create pool key with sorted currencies
         (Currency currency0, Currency currency1) = _sortCurrencies(
@@ -195,6 +206,20 @@ contract RatchetFactory is IRatchetFactory {
         }
 
         return result;
+    }
+
+    /// @notice Verify and claim a vault for a creator
+    /// @dev Only callable by the VERIFIER address
+    /// @param vault The vault to claim
+    /// @param newOwner The new owner address
+    function verifyClaim(address vault, address newOwner) external {
+        if (msg.sender != VERIFIER) revert OnlyVerifier();
+
+        RatchetVault v = RatchetVault(payable(vault));
+        string memory creatorStr = v.creator();
+        v.setClaimed(newOwner);
+
+        emit CreatorClaimed(vault, newOwner, creatorStr);
     }
 
     /// @notice Add initial liquidity and burn the LP position
@@ -267,18 +292,21 @@ contract RatchetFactory is IRatchetFactory {
     /// @param salt Unique salt for this deployment
     /// @param initialReactiveSellRate_ Initial sell rate for vault
     /// @param teamRecipient_ Team recipient address
+    /// @param creator_ Creator identifier string
     /// @return Predicted vault address
     function _computeCreate2Address(
         bytes32 salt,
         uint256 initialReactiveSellRate_,
-        address teamRecipient_
+        address teamRecipient_,
+        string calldata creator_
     ) internal view returns (address) {
         bytes memory bytecode = abi.encodePacked(
             type(RatchetVault).creationCode,
             abi.encode(
                 address(HOOK),
                 teamRecipient_,
-                initialReactiveSellRate_
+                initialReactiveSellRate_,
+                creator_
             )
         );
 
