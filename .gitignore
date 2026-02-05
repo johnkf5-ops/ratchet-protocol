@@ -1,0 +1,22 @@
+# Compiler output
+cache/
+out/
+
+# Broadcast logs (contain transaction data and sensitive values)
+broadcast/
+
+# Environment and secrets
+.env
+.env.*
+*.key
+
+# Coverage
+lcov.info
+coverage/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Claude Code local settings
+.claude/
