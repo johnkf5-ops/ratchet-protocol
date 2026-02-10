@@ -7,9 +7,6 @@ import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 /// @notice Simple ERC20 token deployed by Ratchet factory
 /// @dev Entire supply minted at deployment, split between LP and team vault
 contract RatchetToken is ERC20 {
-    address public immutable FACTORY;
-    address public immutable VAULT;
-
     constructor(
         string memory name_,
         string memory symbol_,
@@ -18,9 +15,6 @@ contract RatchetToken is ERC20 {
         address lpRecipient,
         address vault_
     ) ERC20(name_, symbol_) {
-        FACTORY = msg.sender;
-        VAULT = vault_;
-
         _mint(lpRecipient, lpSupply);
         _mint(vault_, vaultSupply);
     }

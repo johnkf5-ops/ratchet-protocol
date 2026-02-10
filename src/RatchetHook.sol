@@ -12,6 +12,9 @@ import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
+import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
+import {IWETH9} from "@uniswap/v4-periphery/src/interfaces/external/IWETH9.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 import {IRatchetHook} from "./interfaces/IRatchetHook.sol";
 import {IRatchetVault} from "./interfaces/IRatchetVault.sol";
@@ -20,7 +23,7 @@ import {IRatchetVault} from "./interfaces/IRatchetVault.sol";
 /// @notice Uniswap v4 hook that triggers reactive vault sells on token buys
 /// @dev Intercepts afterSwap to detect buys and route fees appropriately.
 ///      ETH fees go to team (configurable %), token fees return to LP.
-contract RatchetHook is BaseHook, IRatchetHook {
+contract RatchetHook is BaseHook, IRatchetHook, IUnlockCallback, ReentrancyGuard {
     using PoolIdLibrary for PoolKey;
     using CurrencyLibrary for Currency;
     using SafeERC20 for IERC20;
@@ -34,8 +37,8 @@ contract RatchetHook is BaseHook, IRatchetHook {
     address public immutable FACTORY;
     /// @notice Protocol fee recipient address
     address public immutable PROTOCOL_RECIPIENT;
-    /// @notice Team's share of ETH fees in basis points (e.g., 500 = 5%)
-    uint256 public teamFeeShare;
+    /// @notice Wrapped ETH contract for LP fee donations
+    IWETH9 public immutable WETH;
 
     /// @notice Accumulated protocol fees available for claiming
     uint256 public protocolFeesAccumulated;
@@ -48,11 +51,20 @@ contract RatchetHook is BaseHook, IRatchetHook {
     mapping(bytes32 => bool) public tokenIsCurrency0;
     /// @notice Maps pool ID to accumulated ETH fees for that pool
     mapping(bytes32 => uint256) public poolEthFees;
+    /// @notice Maps pool ID to team's share of ETH fees in basis points (max 10000 = 100%)
+    mapping(bytes32 => uint256) public poolTeamFeeShare;
+    /// @notice Total ETH fees tracked across all pools (for sweep accounting)
+    uint256 public totalPoolEthFees;
 
     error OnlyFactory();
     error OnlyProtocol();
     error PoolAlreadyInitialized();
     error PoolNotInitialized();
+    error OnlyPoolManager();
+    error TeamFeeShareTooHigh();
+    error NoFeesToClaim();
+    error NoFeesToRoute();
+    error ZeroValue();
 
     modifier onlyFactory() {
         _checkFactory();
@@ -71,14 +83,19 @@ contract RatchetHook is BaseHook, IRatchetHook {
     /// @notice Deploy the hook
     /// @param poolManager_ Uniswap v4 pool manager
     /// @param factory_ Factory contract authorized to register pools
-    /// @param defaultTeamFeeShare_ Default team fee share in basis points
     /// @param protocolRecipient_ Address that receives protocol fees
-    constructor(IPoolManager poolManager_, address factory_, uint256 defaultTeamFeeShare_, address protocolRecipient_)
+    /// @param weth_ Wrapped ETH contract for LP fee donations
+    constructor(
+        IPoolManager poolManager_,
+        address factory_,
+        address protocolRecipient_,
+        IWETH9 weth_
+    )
         BaseHook(poolManager_)
     {
         FACTORY = factory_;
-        teamFeeShare = defaultTeamFeeShare_;
         PROTOCOL_RECIPIENT = protocolRecipient_;
+        WETH = weth_;
     }
 
     /// @notice Register a new pool with its vault. Called by factory during launch.
@@ -86,18 +103,23 @@ contract RatchetHook is BaseHook, IRatchetHook {
     /// @param token_ The token address (non-ETH side of pair)
     /// @param vault The vault that holds team tokens for this pool
     /// @param tokenIsCurrency0_ Whether the token is currency0 (affects buy detection)
+    /// @param teamFeeShareBps_ Team's share of ETH fees in basis points (max 10000 = 100%)
     function registerPool(
         PoolKey calldata key,
         address token_,
         address vault,
-        bool tokenIsCurrency0_
+        bool tokenIsCurrency0_,
+        uint256 teamFeeShareBps_
     ) external onlyFactory {
+        if (teamFeeShareBps_ > BPS_DENOMINATOR) revert TeamFeeShareTooHigh();
+
         bytes32 poolId = PoolId.unwrap(key.toId());
         if (poolVaults[poolId] != address(0)) revert PoolAlreadyInitialized();
 
         poolVaults[poolId] = vault;
         poolTokens[poolId] = token_;
         tokenIsCurrency0[poolId] = tokenIsCurrency0_;
+        poolTeamFeeShare[poolId] = teamFeeShareBps_;
 
         // Set max approval once to avoid repeated approvals on each swap
         IERC20(token_).approve(address(poolManager), type(uint256).max);
@@ -158,7 +180,10 @@ contract RatchetHook is BaseHook, IRatchetHook {
         // If token is currency1: buy = zeroForOne=true (spending ETH/currency0 to get token/currency1)
         bool isBuy = _tokenIsCurrency0 ? !params.zeroForOne : params.zeroForOne;
 
-        if (isBuy) {
+        // Only trigger on exact-input buys (amountSpecified < 0)
+        // For exact-output buys, the hookDelta applies to the input (ETH) currency,
+        // not the output (token), which would cause incorrect behavior.
+        if (isBuy && params.amountSpecified < 0) {
             // Get the amount of tokens being bought
             // When buying, tokens flow out of pool (negative delta for that currency)
             int128 tokenDelta = _tokenIsCurrency0 ? delta.amount0() : delta.amount1();
@@ -170,9 +195,15 @@ contract RatchetHook is BaseHook, IRatchetHook {
                 uint256 sellAmount = IRatchetVault(vault).onBuy(buyAmount);
 
                 if (sellAmount > 0) {
+                    // Settle the token debt with the pool manager.
+                    // The vault transferred sellAmount tokens to this hook via onBuy().
+                    // We must sync → transfer → settle before returning the hookDelta.
+                    Currency tokenCurrency = _tokenIsCurrency0 ? key.currency0 : key.currency1;
+                    poolManager.sync(tokenCurrency);
+                    IERC20(poolTokens[poolId]).safeTransfer(address(poolManager), sellAmount);
+                    poolManager.settle();
+
                     // Return negative delta = more tokens going out to buyer
-                    // The delta must be for the same currency as the token
-                    // (approval set to max in registerPool)
                     return (this.afterSwap.selector, -sellAmount.toInt256().toInt128());
                 }
             }
@@ -185,55 +216,87 @@ contract RatchetHook is BaseHook, IRatchetHook {
     /// @dev Use this instead of direct transfers to ensure proper per-pool accounting
     /// @param poolId The pool to credit the fees to
     function depositFees(bytes32 poolId) external payable {
+        if (msg.value == 0) revert ZeroValue();
         if (poolVaults[poolId] == address(0)) revert PoolNotInitialized();
         poolEthFees[poolId] += msg.value;
+        totalPoolEthFees += msg.value;
+
+        emit FeesDeposited(poolId, msg.sender, msg.value);
     }
 
-    /// @notice Distribute accumulated fees for a specific pool
-    /// @dev Takes 20% protocol fee first, then sends teamFeeShare% of remaining to vault, donates tokens to LP
+    /// @notice Distribute accumulated ETH fees for a specific pool
+    /// @dev Takes 20% protocol fee first, then sends teamFeeShare% of remaining to vault,
+    ///      donates LP share as WETH via poolManager.unlock(). Protected against reentrancy.
     /// @param key The pool to route fees for
-    function routeFees(PoolKey calldata key) external {
+    function routeFees(PoolKey calldata key) external nonReentrant {
         bytes32 poolId = PoolId.unwrap(key.toId());
         address vault = poolVaults[poolId];
         if (vault == address(0)) revert PoolNotInitialized();
 
-        // Send team's share of tracked ETH fees to vault
         uint256 ethFees = poolEthFees[poolId];
-        if (ethFees > 0) {
-            // Clear balance before transfer to prevent reentrancy
-            poolEthFees[poolId] = 0;
+        if (ethFees == 0) revert NoFeesToRoute();
 
-            // Protocol takes 20% off the top
-            uint256 protocolFee = (ethFees * PROTOCOL_FEE_BPS) / BPS_DENOMINATOR;
-            protocolFeesAccumulated += protocolFee;
+        // Clear balance before transfers (checks-effects-interactions)
+        poolEthFees[poolId] = 0;
+        totalPoolEthFees -= ethFees;
 
-            // Remaining 80% is split between team and hook
-            uint256 remaining = ethFees - protocolFee;
-            uint256 toTeam = (remaining * teamFeeShare) / BPS_DENOMINATOR;
-            if (toTeam > 0) {
-                (bool success,) = vault.call{value: toTeam}("");
-                require(success, "ETH transfer failed");
-            }
-            // Note: remaining ETH (remaining - toTeam) stays in contract as LP revenue
-            // or could be donated back to LP in a future implementation
+        // Protocol takes 20% off the top
+        uint256 protocolFee = (ethFees * PROTOCOL_FEE_BPS) / BPS_DENOMINATOR;
+        protocolFeesAccumulated += protocolFee;
+
+        // Remaining 80% is split between team and LP
+        uint256 remaining = ethFees - protocolFee;
+        uint256 toTeam = (remaining * poolTeamFeeShare[poolId]) / BPS_DENOMINATOR;
+        uint256 lpEth = remaining - toTeam;
+
+        if (toTeam > 0) {
+            (bool success,) = vault.call{value: toTeam}("");
+            require(success, "ETH transfer failed");
         }
 
-        // Donate token fees back to LP (increases LP value)
-        // Token balance is pool-specific since each pool has unique token
-        // (approval set to max in registerPool)
-        address token_ = poolTokens[poolId];
-        uint256 tokenFees = IERC20(token_).balanceOf(address(this));
-        if (tokenFees > 0) {
-            poolManager.donate(key, 0, tokenFees, "");
+        // Donate LP ETH to LP via pool manager unlock callback
+        if (lpEth > 0) {
+            bool _tokenIsCurrency0 = tokenIsCurrency0[poolId];
+            poolManager.unlock(
+                abi.encode(key, _tokenIsCurrency0, lpEth)
+            );
         }
 
-        emit FeesRouted(ethFees * teamFeeShare / BPS_DENOMINATOR, tokenFees);
+        emit FeesRouted(poolId, toTeam, lpEth);
+    }
+
+    /// @notice Callback from pool manager during unlock, used to donate LP ETH as WETH
+    /// @dev Only callable by the pool manager as part of the unlock flow.
+    /// @param data ABI-encoded (PoolKey, bool tokenIsCurrency0, uint256 lpEth)
+    /// @return Empty bytes (no return data needed)
+    function unlockCallback(bytes calldata data) external override returns (bytes memory) {
+        if (msg.sender != address(poolManager)) revert OnlyPoolManager();
+
+        (PoolKey memory key, bool _tokenIsCurrency0, uint256 lpEth) =
+            abi.decode(data, (PoolKey, bool, uint256));
+
+        // Wrap ETH to WETH and donate to LP on the WETH side.
+        // donate() creates a debt (positive delta) that we settle afterward.
+        // This is valid because v4 checks net-zero deltas at the end of unlock, not per-operation.
+        WETH.deposit{value: lpEth}();
+        if (_tokenIsCurrency0) {
+            poolManager.donate(key, 0, lpEth, "");
+        } else {
+            poolManager.donate(key, lpEth, 0, "");
+        }
+        Currency wethCurrency = _tokenIsCurrency0 ? key.currency1 : key.currency0;
+        poolManager.sync(wethCurrency);
+        IERC20(address(WETH)).safeTransfer(address(poolManager), lpEth);
+        poolManager.settle();
+
+        return "";
     }
 
     /// @notice Claim accumulated protocol fees
     /// @dev Only callable by PROTOCOL_RECIPIENT. Transfers all accumulated protocol fees.
     function claimProtocolFees() external onlyProtocol {
         uint256 amount = protocolFeesAccumulated;
+        if (amount == 0) revert NoFeesToClaim();
         protocolFeesAccumulated = 0;
 
         (bool success,) = PROTOCOL_RECIPIENT.call{value: amount}("");
@@ -242,7 +305,30 @@ contract RatchetHook is BaseHook, IRatchetHook {
         emit ProtocolFeeClaimed(PROTOCOL_RECIPIENT, amount);
     }
 
+    /// @notice Sweep tokens accidentally sent to the hook
+    /// @dev Only callable by PROTOCOL_RECIPIENT. Recovers any ERC20 tokens on this contract.
+    /// @param token_ The token to sweep
+    /// @param to The recipient address
+    function sweepTokens(address token_, address to) external onlyProtocol {
+        uint256 balance = IERC20(token_).balanceOf(address(this));
+        if (balance > 0) {
+            IERC20(token_).safeTransfer(to, balance);
+        }
+    }
+
+    /// @notice Sweep untracked ETH to protocol recipient
+    /// @dev Recovers ETH sent directly to the hook without using depositFees
+    function sweepETH() external onlyProtocol {
+        uint256 tracked = protocolFeesAccumulated + totalPoolEthFees;
+        uint256 balance = address(this).balance;
+        if (balance > tracked) {
+            uint256 untracked = balance - tracked;
+            (bool success,) = PROTOCOL_RECIPIENT.call{value: untracked}("");
+            require(success, "ETH transfer failed");
+        }
+    }
+
     /// @notice Accept ETH but require explicit pool association via depositFees
-    /// @dev ETH sent directly without pool ID goes to untracked balance (recoverable by admin)
+    /// @dev ETH sent directly without pool ID goes to untracked balance (recoverable via sweepETH)
     receive() external payable {}
 }

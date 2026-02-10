@@ -15,11 +15,17 @@ contract RatchetVault is IRatchetVault {
     /// @notice Maximum reactive sell rate (10% = 1000 bps)
     uint256 public constant MAX_REACTIVE_SELL_RATE = 1000;
     uint256 public constant BPS_DENOMINATOR = 10000;
+    /// @notice Maximum reactive sell per buy as fraction of vault balance (5%)
+    uint256 public constant MAX_SELL_PER_BUY_BPS = 500;
+    /// @notice Time after deployment before unclaimed vaults can be expired
+    uint256 public constant CLAIM_EXPIRY = 90 days;
 
     /// @notice The factory that deployed this vault (can initialize token)
     address public immutable FACTORY;
     /// @notice The hook contract authorized to trigger reactive sells
     address public immutable HOOK;
+    /// @notice Timestamp when vault was deployed
+    uint256 public immutable deployedAt;
 
     /// @notice The team address that receives ETH fees and controls the ratchet
     address private teamRecipient_;
@@ -34,6 +40,10 @@ contract RatchetVault is IRatchetVault {
     uint256 public reactiveSellRate;
     /// @notice ETH fees accumulated from hook, claimable by team
     uint256 public accumulatedFees;
+    /// @notice Last block number when a reactive sell occurred (for per-block cap)
+    uint256 private lastSellBlock;
+    /// @notice Cumulative sell amount in the current block
+    uint256 private blockSellAmount;
 
     error OnlyHook();
     error OnlyTeam();
@@ -44,6 +54,8 @@ contract RatchetVault is IRatchetVault {
     error AlreadyInitialized();
     error ZeroAddress();
     error NotYetClaimed();
+    error ClaimNotExpired();
+    error AlreadyClaimed();
 
     modifier onlyHook() {
         _checkHook();
@@ -75,10 +87,12 @@ contract RatchetVault is IRatchetVault {
         string memory creator_
     ) {
         if (hook_ == address(0)) revert ZeroAddress();
+        if (teamRecipient__ == address(0)) revert ZeroAddress();
         if (initialReactiveSellRate_ > MAX_REACTIVE_SELL_RATE) revert RateTooHigh();
 
         FACTORY = msg.sender;
         HOOK = hook_;
+        deployedAt = block.timestamp;
         teamRecipient_ = teamRecipient__;
         reactiveSellRate = initialReactiveSellRate_;
         creator = creator_;
@@ -107,6 +121,18 @@ contract RatchetVault is IRatchetVault {
         if (sellAmount > balance) {
             sellAmount = balance;
         }
+
+        // Per-block cumulative cap to limit flash-loan / split-buy extraction
+        if (block.number != lastSellBlock) {
+            lastSellBlock = block.number;
+            blockSellAmount = 0;
+        }
+        uint256 blockStartBalance = balance + blockSellAmount;
+        uint256 maxBlockSell = (blockStartBalance * MAX_SELL_PER_BUY_BPS) / BPS_DENOMINATOR;
+        if (blockSellAmount + sellAmount > maxBlockSell) {
+            sellAmount = maxBlockSell > blockSellAmount ? maxBlockSell - blockSellAmount : 0;
+        }
+        blockSellAmount += sellAmount;
 
         if (sellAmount > 0) {
             IERC20(TOKEN).safeTransfer(HOOK, sellAmount);
@@ -143,18 +169,30 @@ contract RatchetVault is IRatchetVault {
     }
 
     /// @notice Set the vault as claimed with a new team recipient
-    /// @dev Only callable by the factory contract
+    /// @dev Only callable by the factory contract. Cannot re-claim an already claimed vault.
     /// @param newRecipient The new team recipient address
     function setClaimed(address newRecipient) external {
         if (msg.sender != FACTORY) revert OnlyFactory();
+        if (claimed) revert AlreadyClaimed();
+        if (newRecipient == address(0)) revert ZeroAddress();
         teamRecipient_ = newRecipient;
         claimed = true;
 
         emit CreatorClaimed(address(this), newRecipient);
     }
 
+    /// @notice Expire an unclaimed vault after the claim period has passed
+    /// @dev Preserves the original teamRecipient, allowing them to claim fees and manage the vault
+    function expireClaim() external {
+        if (claimed) return;
+        if (block.timestamp < deployedAt + CLAIM_EXPIRY) revert ClaimNotExpired();
+        claimed = true;
+        emit ClaimExpired(address(this), teamRecipient_);
+    }
+
     /// @notice Receive ETH fees from hook
     receive() external payable {
+        if (msg.sender != HOOK) revert OnlyHook();
         accumulatedFees += msg.value;
     }
 

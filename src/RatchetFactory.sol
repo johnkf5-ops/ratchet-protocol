@@ -9,6 +9,7 @@ import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 
 import {IPositionManager} from "@uniswap/v4-periphery/src/interfaces/IPositionManager.sol";
 import {Actions} from "@uniswap/v4-periphery/src/libraries/Actions.sol";
@@ -29,12 +30,17 @@ contract RatchetFactory is IRatchetFactory {
     using PoolIdLibrary for PoolKey;
     using CurrencyLibrary for Currency;
     using SafeERC20 for IERC20;
+    using SafeCast for uint256;
 
     uint256 public constant BPS_DENOMINATOR = 10000;
     /// @notice Maximum team allocation (20%)
     uint256 public constant MAX_TEAM_ALLOCATION = 2000;
     /// @notice Maximum initial reactive sell rate (10%)
     uint256 public constant MAX_REACTIVE_SELL_RATE = 1000;
+    /// @notice Maximum total token supply (prevents int128 overflow in hook)
+    uint256 public constant MAX_TOTAL_SUPPLY = type(uint128).max;
+    /// @notice Maximum team fee share (50%)
+    uint256 public constant MAX_TEAM_FEE_SHARE = 5000;
     /// @notice Address to burn LP tokens (dead address)
     address public constant BURN_ADDRESS = 0x000000000000000000000000000000000000dEaD;
 
@@ -48,8 +54,10 @@ contract RatchetFactory is IRatchetFactory {
     IAllowanceTransfer public immutable PERMIT2;
     /// @notice Wrapped ETH contract on this chain
     IWETH9 public immutable WETH;
-    /// @notice Verifier address authorized to call verifyClaim
-    address public immutable VERIFIER;
+    /// @notice Verifier address authorized to call verifyClaim (transferable via two-step)
+    address public verifier;
+    /// @notice Pending verifier address (must call acceptVerifier to complete transfer)
+    address public pendingVerifier;
 
     /// @notice Default swap fee (1%)
     uint24 public constant DEFAULT_FEE = 10000;
@@ -58,6 +66,8 @@ contract RatchetFactory is IRatchetFactory {
 
     /// @notice Counter for generating unique salts
     uint256 public launchCount;
+    /// @notice Tracks vaults deployed by this factory
+    mapping(address => bool) public deployedVaults;
 
     error TeamAllocationTooHigh();
     error ReactiveSellRateTooHigh();
@@ -65,6 +75,13 @@ contract RatchetFactory is IRatchetFactory {
     error RefundFailed();
     error InvalidHook();
     error OnlyVerifier();
+    error ZeroAddress();
+    error OnlyWETH();
+    error OnlyPendingVerifier();
+    error TotalSupplyTooHigh();
+    error TeamFeeShareTooHigh();
+    error ZeroTotalSupply();
+    error VaultNotDeployed();
 
     /// @notice Deploy the factory with a pre-deployed hook
     /// @dev The hook must be deployed at a mined address with correct permission flags.
@@ -92,7 +109,7 @@ contract RatchetFactory is IRatchetFactory {
         PERMIT2 = permit2_;
         WETH = weth_;
         HOOK = hook_;
-        VERIFIER = verifier_;
+        verifier = verifier_;
 
         // Approve Permit2 to spend WETH (unlimited, one-time setup)
         IERC20(address(weth_)).approve(address(permit2_), type(uint256).max);
@@ -106,8 +123,11 @@ contract RatchetFactory is IRatchetFactory {
     /// @param params Launch configuration (name, symbol, supply, allocations, price)
     /// @return result Deployed addresses and pool ID
     function launch(LaunchParams calldata params) external payable returns (LaunchResult memory result) {
+        if (params.totalSupply == 0) revert ZeroTotalSupply();
+        if (params.totalSupply > MAX_TOTAL_SUPPLY) revert TotalSupplyTooHigh();
         if (params.teamAllocationBps > MAX_TEAM_ALLOCATION) revert TeamAllocationTooHigh();
         if (params.initialReactiveSellRate > MAX_REACTIVE_SELL_RATE) revert ReactiveSellRateTooHigh();
+        if (params.teamFeeShareBps > MAX_TEAM_FEE_SHARE) revert TeamFeeShareTooHigh();
         if (msg.value == 0) revert InsufficientETH();
 
         // Track ETH balance before operations
@@ -147,6 +167,7 @@ contract RatchetFactory is IRatchetFactory {
             params.creator
         );
         require(address(vault) == vaultAddress, "Vault address mismatch");
+        deployedVaults[address(vault)] = true;
 
         // Initialize vault with token address
         vault.initialize(address(token));
@@ -174,7 +195,7 @@ contract RatchetFactory is IRatchetFactory {
         });
 
         // Register pool with hook before initialization (include token position for buy detection)
-        HOOK.registerPool(key, address(token), address(vault), tokenIsCurrency0);
+        HOOK.registerPool(key, address(token), address(vault), tokenIsCurrency0, params.teamFeeShareBps);
 
         // Initialize pool at specified price
         POOL_MANAGER.initialize(key, params.initialSqrtPriceX96);
@@ -213,13 +234,45 @@ contract RatchetFactory is IRatchetFactory {
     /// @param vault The vault to claim
     /// @param newOwner The new owner address
     function verifyClaim(address vault, address newOwner) external {
-        if (msg.sender != VERIFIER) revert OnlyVerifier();
+        if (msg.sender != verifier) revert OnlyVerifier();
+        if (!deployedVaults[vault]) revert VaultNotDeployed();
 
         RatchetVault v = RatchetVault(payable(vault));
         string memory creatorStr = v.creator();
         v.setClaimed(newOwner);
 
         emit CreatorClaimed(vault, newOwner, creatorStr);
+    }
+
+    /// @notice Propose a new verifier address (first step of two-step transfer)
+    /// @dev Only callable by the current verifier. The proposed address must call acceptVerifier().
+    /// @param newVerifier The proposed new verifier address
+    function proposeVerifier(address newVerifier) external {
+        if (msg.sender != verifier) revert OnlyVerifier();
+        if (newVerifier == address(0)) revert ZeroAddress();
+        pendingVerifier = newVerifier;
+        emit VerifierProposed(verifier, newVerifier);
+    }
+
+    /// @notice Accept the verifier role (second step of two-step transfer)
+    /// @dev Only callable by the pending verifier address
+    function acceptVerifier() external {
+        if (msg.sender != pendingVerifier) revert OnlyPendingVerifier();
+        emit VerifierUpdated(verifier, msg.sender);
+        verifier = msg.sender;
+        pendingVerifier = address(0);
+    }
+
+    /// @notice Sweep tokens accidentally sent to the factory
+    /// @dev Only callable by the verifier. Recovers any ERC20 tokens on this contract.
+    /// @param token_ The token to sweep
+    /// @param to The recipient address
+    function sweepTokens(address token_, address to) external {
+        if (msg.sender != verifier) revert OnlyVerifier();
+        uint256 balance = IERC20(token_).balanceOf(address(this));
+        if (balance > 0) {
+            IERC20(token_).safeTransfer(to, balance);
+        }
     }
 
     /// @notice Add initial liquidity and burn the LP position
@@ -275,8 +328,8 @@ contract RatchetFactory is IRatchetFactory {
             tickLower,
             tickUpper,
             liquidity,
-            type(uint128).max, // amount0Max (no slippage check for initial mint)
-            type(uint128).max, // amount1Max
+            amount0.toUint128(),  // amount0Max (safe cast)
+            amount1.toUint128(),  // amount1Max (safe cast)
             BURN_ADDRESS,      // LP NFT goes directly to burn address
             ""                 // hookData
         );
@@ -286,6 +339,12 @@ contract RatchetFactory is IRatchetFactory {
         // 6. Execute the mint - deadline is current block timestamp + buffer
         bytes memory unlockData = abi.encode(actions, params);
         POSITION_MANAGER.modifyLiquidities(unlockData, block.timestamp + 60);
+
+        // 7. Unwrap excess WETH back to ETH so the refund mechanism in launch() can return it
+        uint256 wethBalance = IERC20(address(WETH)).balanceOf(address(this));
+        if (wethBalance > 0) {
+            WETH.withdraw(wethBalance);
+        }
     }
 
     /// @notice Compute CREATE2 address for vault deployment
@@ -326,6 +385,8 @@ contract RatchetFactory is IRatchetFactory {
         return Currency.unwrap(a) < Currency.unwrap(b) ? (a, b) : (b, a);
     }
 
-    /// @notice Accept ETH for liquidity provision
-    receive() external payable {}
+    /// @notice Accept ETH from WETH unwrapping only
+    receive() external payable {
+        if (msg.sender != address(WETH)) revert OnlyWETH();
+    }
 }

@@ -103,9 +103,6 @@ contract DeployRatchetHookScript is Script {
     address constant SEPOLIA_PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
     address constant SEPOLIA_WETH = 0x4200000000000000000000000000000000000006;
 
-    /// @notice Default team fee share (5%)
-    uint256 constant DEFAULT_TEAM_FEE_SHARE = 500;
-
     function run() public {
         uint256 deployerPrivateKey = vm.envUint("PRIVATE_KEY");
         bool isTestnet = vm.envOr("TESTNET", true);
@@ -147,12 +144,12 @@ contract DeployRatchetHookScript is Script {
         console.log("");
 
         // Step 3: Mine hook address
-        // protocolRecipient is the deployer
+        // protocolRecipient is the deployer (receives protocol fees)
         bytes memory constructorArgs = abi.encode(
             IPoolManager(poolManager),
             predictedFactoryAddress,
-            DEFAULT_TEAM_FEE_SHARE,
-            deployer
+            deployer,
+            IWETH9(weth)
         );
 
         console.log("Step 3: Mining Hook Address...");

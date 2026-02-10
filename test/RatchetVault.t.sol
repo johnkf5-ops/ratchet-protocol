@@ -94,8 +94,9 @@ contract RatchetVaultTest is Test {
     }
 
     function test_ClaimFees() public {
-        // Send ETH to vault via receive() to accumulate fees
-        vm.deal(address(this), 1 ether);
+        // Send ETH to vault via receive() (must come from hook)
+        vm.deal(hook, 1 ether);
+        vm.prank(hook);
         (bool success,) = address(vault).call{value: 1 ether}("");
         require(success, "ETH send failed");
 
@@ -129,14 +130,16 @@ contract RatchetVaultTest is Test {
 
     function test_SellCappedByBalance() public {
         // Try to trigger a sell larger than vault balance
-        uint256 hugeAmount = VAULT_SUPPLY * 100; // Would result in 10x vault balance at 10% rate
-        uint256 expectedSell = VAULT_SUPPLY; // Capped at actual balance
+        // buyAmount * 10% rate = 1,000,000e18 which exceeds VAULT_SUPPLY (100,000e18)
+        // Capped first at balance (100,000e18), then at per-block cap (5% of 100,000e18 = 5,000e18)
+        uint256 hugeAmount = VAULT_SUPPLY * 100;
+        uint256 expectedSell = (VAULT_SUPPLY * 500) / 10000; // MAX_SELL_PER_BUY_BPS cap
 
         vm.prank(hook);
         uint256 sellAmount = vault.onBuy(hugeAmount);
 
         assertEq(sellAmount, expectedSell);
-        assertEq(token.balanceOf(address(vault)), 0);
+        assertEq(token.balanceOf(address(vault)), VAULT_SUPPLY - expectedSell);
     }
 
     function test_InitializeOnlyOnce() public {
@@ -184,8 +187,9 @@ contract RatchetVaultTest is Test {
         RatchetVault unclaimed = new RatchetVault(hook, team, INITIAL_RATE, "someCreator");
         unclaimed.initialize(address(token));
 
-        // Send ETH to accumulate fees
-        vm.deal(address(this), 1 ether);
+        // Send ETH to accumulate fees (must come from hook)
+        vm.deal(hook, 1 ether);
+        vm.prank(hook);
         (bool success,) = address(unclaimed).call{value: 1 ether}("");
         require(success, "ETH send failed");
 
@@ -252,8 +256,9 @@ contract RatchetVaultTest is Test {
         address newRecipient = makeAddr("newRecipient");
         v.setClaimed(newRecipient);
 
-        // Send ETH to accumulate fees
-        vm.deal(address(this), 2 ether);
+        // Send ETH to accumulate fees (must come from hook)
+        vm.deal(hook, 2 ether);
+        vm.prank(hook);
         (bool success,) = address(v).call{value: 2 ether}("");
         require(success, "ETH send failed");
 
@@ -303,6 +308,38 @@ contract RatchetVaultTest is Test {
 
         // The protocol fee should be 20% of total fees
         assertEq(protocolFee * 5, ethFees);
+    }
+
+    function test_SetClaimedRevertsIfAlreadyClaimed() public {
+        // Deploy vault, claim it, then try to claim again
+        RatchetVault v = new RatchetVault(hook, team, INITIAL_RATE, "creator");
+        v.initialize(address(token));
+        v.setClaimed(team);
+
+        // Second setClaimed should revert
+        vm.expectRevert(RatchetVault.AlreadyClaimed.selector);
+        v.setClaimed(makeAddr("other"));
+    }
+
+    function test_PerBlockSellCap() public {
+        // Multiple buys in the same block should be capped cumulatively
+        uint256 buyAmount = 10_000e18;
+        // At 10% rate: sellAmount = 1,000e18
+        // maxBlockSell = VAULT_SUPPLY * 500 / 10000 = 5,000e18
+        // First buy: 1,000e18 (cumulative: 1,000e18) - within cap
+        // Second buy: 1,000e18 (cumulative: 2,000e18) - within cap
+        // ...up to 5 buys before hitting cap
+
+        uint256 totalSold;
+        for (uint256 i = 0; i < 10; i++) {
+            vm.prank(hook);
+            uint256 sold = vault.onBuy(buyAmount);
+            totalSold += sold;
+        }
+
+        // Should be capped at 5% of vault balance = 5,000e18
+        uint256 maxBlockSell = (VAULT_SUPPLY * 500) / 10000;
+        assertEq(totalSold, maxBlockSell);
     }
 
     function test_ClaimProtocolFeesRevertsForNonRecipient() public {
