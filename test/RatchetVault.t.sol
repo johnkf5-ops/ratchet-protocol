@@ -218,6 +218,25 @@ contract RatchetVaultTest is Test {
         unclaimed.setClaimed(team);
     }
 
+    function test_SetClaimedRevertsIfAlreadyClaimed() public {
+        // Deploy unclaimed vault (this contract is factory)
+        RatchetVault unclaimed = new RatchetVault(hook, team, INITIAL_RATE, "someCreator");
+        unclaimed.initialize(address(token));
+
+        // First claim succeeds
+        address owner1 = makeAddr("owner1");
+        unclaimed.setClaimed(owner1);
+        assertTrue(unclaimed.claimed());
+
+        // Second claim reverts
+        address owner2 = makeAddr("owner2");
+        vm.expectRevert(RatchetVault.AlreadyClaimed.selector);
+        unclaimed.setClaimed(owner2);
+
+        // Original owner is preserved
+        assertEq(unclaimed.teamRecipient(), owner1);
+    }
+
     function test_OnBuyWorksWhenUnclaimed() public {
         // Deploy unclaimed vault with this contract as factory
         RatchetVault unclaimed = new RatchetVault(hook, team, INITIAL_RATE, "someCreator");
@@ -308,17 +327,6 @@ contract RatchetVaultTest is Test {
 
         // The protocol fee should be 20% of total fees
         assertEq(protocolFee * 5, ethFees);
-    }
-
-    function test_SetClaimedRevertsIfAlreadyClaimed() public {
-        // Deploy vault, claim it, then try to claim again
-        RatchetVault v = new RatchetVault(hook, team, INITIAL_RATE, "creator");
-        v.initialize(address(token));
-        v.setClaimed(team);
-
-        // Second setClaimed should revert
-        vm.expectRevert(RatchetVault.AlreadyClaimed.selector);
-        v.setClaimed(makeAddr("other"));
     }
 
     function test_PerBlockSellCap() public {

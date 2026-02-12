@@ -185,11 +185,12 @@ contract RatchetHook is BaseHook, IRatchetHook, IUnlockCallback, ReentrancyGuard
         // not the output (token), which would cause incorrect behavior.
         if (isBuy && params.amountSpecified < 0) {
             // Get the amount of tokens being bought
-            // When buying, tokens flow out of pool (negative delta for that currency)
+            // In v4 delta convention: positive = credit (swapper receives tokens)
+            // When buying tokens, the token delta is POSITIVE for the swapper
             int128 tokenDelta = _tokenIsCurrency0 ? delta.amount0() : delta.amount1();
 
-            if (tokenDelta < 0) {
-                uint256 buyAmount = int256(-tokenDelta).toUint256();
+            if (tokenDelta > 0) {
+                uint256 buyAmount = uint256(int256(tokenDelta));
 
                 // Trigger reactive sell - vault transfers tokens to this hook
                 uint256 sellAmount = IRatchetVault(vault).onBuy(buyAmount);
