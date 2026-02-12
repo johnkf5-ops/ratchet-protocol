@@ -396,6 +396,93 @@ contract RatchetIntegrationTest is Test, Deployers {
         assertGt(sold2, 0, "No sell on buy 2");
     }
 
+    // ========== H-3: Protocol Recipient Transfer ==========
+
+    function test_ProposeAndAcceptProtocolTransfer() public {
+        address newRecipient = makeAddr("newProtocolRecipient");
+
+        vm.prank(protocolRecipient);
+        ratchetHook.proposeProtocolTransfer(newRecipient);
+        assertEq(ratchetHook.pendingProtocolRecipient(), newRecipient);
+
+        vm.prank(newRecipient);
+        ratchetHook.acceptProtocolTransfer();
+        assertEq(ratchetHook.protocolRecipient(), newRecipient);
+        assertEq(ratchetHook.pendingProtocolRecipient(), address(0));
+    }
+
+    function test_ProtocolTransferOnlyRecipient() public {
+        address attacker = makeAddr("attacker");
+        vm.prank(attacker);
+        vm.expectRevert(RatchetHook.OnlyProtocol.selector);
+        ratchetHook.proposeProtocolTransfer(attacker);
+    }
+
+    function test_AcceptProtocolTransferOnlyPending() public {
+        address newRecipient = makeAddr("newProtocolRecipient");
+        vm.prank(protocolRecipient);
+        ratchetHook.proposeProtocolTransfer(newRecipient);
+
+        address attacker = makeAddr("attacker");
+        vm.prank(attacker);
+        vm.expectRevert(RatchetHook.OnlyPendingRecipient.selector);
+        ratchetHook.acceptProtocolTransfer();
+    }
+
+    function test_NewRecipientCanClaimProtocolFees() public {
+        // Transfer protocol recipient
+        address newRecipient = makeAddr("newProtocolRecipient");
+        vm.prank(protocolRecipient);
+        ratchetHook.proposeProtocolTransfer(newRecipient);
+        vm.prank(newRecipient);
+        ratchetHook.acceptProtocolTransfer();
+
+        // Deposit and route fees
+        bytes32 pid = PoolId.unwrap(poolKey.toId());
+        ratchetHook.depositFees{value: 1 ether}(pid);
+        ratchetHook.routeFees(poolKey);
+
+        // New recipient claims
+        uint256 balBefore = newRecipient.balance;
+        vm.prank(newRecipient);
+        ratchetHook.claimProtocolFees();
+        assertGt(newRecipient.balance, balBefore);
+    }
+
+    // ========== M-4: Registered Token Sweep Guard ==========
+
+    function test_SweepRegisteredTokenReverts() public {
+        vm.prank(protocolRecipient);
+        vm.expectRevert(RatchetHook.RegisteredToken.selector);
+        ratchetHook.sweepTokens(address(token), protocolRecipient);
+    }
+
+    // ========== L-2: Team Fee Share Cap ==========
+
+    function test_TeamFeeShareCappedAt5000() public {
+        // Try to register with fee share > 50%
+        // Need a new pool key to avoid PoolAlreadyInitialized
+        RatchetToken token2 = new RatchetToken("T2", "T2", 1000e18, 100e18, address(this), address(vault));
+        Currency c0 = Currency.wrap(address(weth));
+        Currency c1 = Currency.wrap(address(token2));
+        if (address(weth) > address(token2)) {
+            (c0, c1) = (c1, c0);
+        }
+        PoolKey memory key2 = PoolKey({
+            currency0: c0,
+            currency1: c1,
+            fee: 10000,
+            tickSpacing: 200,
+            hooks: IHooks(address(ratchetHook))
+        });
+        bool token2IsCurrency0 = Currency.unwrap(key2.currency0) == address(token2);
+
+        vm.expectRevert(RatchetHook.TeamFeeShareTooHigh.selector);
+        ratchetHook.registerPool(key2, address(token2), address(vault), token2IsCurrency0, 5001);
+    }
+
+    // ========== Existing tests ==========
+
     function test_RatchetDecreaseReducesSellAmount() public {
         (bool zeroForOne, uint160 sqrtPriceLimit) = _buyParams(-0.5 ether);
 

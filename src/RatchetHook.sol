@@ -32,11 +32,14 @@ contract RatchetHook is BaseHook, IRatchetHook, IUnlockCallback, ReentrancyGuard
 
     uint256 public constant BPS_DENOMINATOR = 10000;
     uint256 public constant PROTOCOL_FEE_BPS = 2000; // 20%
+    uint256 public constant MAX_TEAM_FEE_SHARE = 5000; // 50%
 
     /// @notice Factory that deployed this hook, only factory can register pools
     address public immutable FACTORY;
-    /// @notice Protocol fee recipient address
-    address public immutable PROTOCOL_RECIPIENT;
+    /// @notice Protocol fee recipient address (transferable via two-step)
+    address public protocolRecipient;
+    /// @notice Pending protocol recipient for two-step transfer
+    address public pendingProtocolRecipient;
     /// @notice Wrapped ETH contract for LP fee donations
     IWETH9 public immutable WETH;
 
@@ -51,10 +54,12 @@ contract RatchetHook is BaseHook, IRatchetHook, IUnlockCallback, ReentrancyGuard
     mapping(bytes32 => bool) public tokenIsCurrency0;
     /// @notice Maps pool ID to accumulated ETH fees for that pool
     mapping(bytes32 => uint256) public poolEthFees;
-    /// @notice Maps pool ID to team's share of ETH fees in basis points (max 10000 = 100%)
+    /// @notice Maps pool ID to team's share of ETH fees in basis points (max 5000 = 50%)
     mapping(bytes32 => uint256) public poolTeamFeeShare;
     /// @notice Total ETH fees tracked across all pools (for sweep accounting)
     uint256 public totalPoolEthFees;
+    /// @notice Tracks tokens registered to pools (prevents accidental sweep)
+    mapping(address => bool) public registeredTokens;
 
     error OnlyFactory();
     error OnlyProtocol();
@@ -65,6 +70,9 @@ contract RatchetHook is BaseHook, IRatchetHook, IUnlockCallback, ReentrancyGuard
     error NoFeesToClaim();
     error NoFeesToRoute();
     error ZeroValue();
+    error OnlyPendingRecipient();
+    error ZeroAddress();
+    error RegisteredToken();
 
     modifier onlyFactory() {
         _checkFactory();
@@ -72,7 +80,7 @@ contract RatchetHook is BaseHook, IRatchetHook, IUnlockCallback, ReentrancyGuard
     }
 
     modifier onlyProtocol() {
-        if (msg.sender != PROTOCOL_RECIPIENT) revert OnlyProtocol();
+        if (msg.sender != protocolRecipient) revert OnlyProtocol();
         _;
     }
 
@@ -94,7 +102,7 @@ contract RatchetHook is BaseHook, IRatchetHook, IUnlockCallback, ReentrancyGuard
         BaseHook(poolManager_)
     {
         FACTORY = factory_;
-        PROTOCOL_RECIPIENT = protocolRecipient_;
+        protocolRecipient = protocolRecipient_;
         WETH = weth_;
     }
 
@@ -111,7 +119,7 @@ contract RatchetHook is BaseHook, IRatchetHook, IUnlockCallback, ReentrancyGuard
         bool tokenIsCurrency0_,
         uint256 teamFeeShareBps_
     ) external onlyFactory {
-        if (teamFeeShareBps_ > BPS_DENOMINATOR) revert TeamFeeShareTooHigh();
+        if (teamFeeShareBps_ > MAX_TEAM_FEE_SHARE) revert TeamFeeShareTooHigh();
 
         bytes32 poolId = PoolId.unwrap(key.toId());
         if (poolVaults[poolId] != address(0)) revert PoolAlreadyInitialized();
@@ -120,6 +128,7 @@ contract RatchetHook is BaseHook, IRatchetHook, IUnlockCallback, ReentrancyGuard
         poolTokens[poolId] = token_;
         tokenIsCurrency0[poolId] = tokenIsCurrency0_;
         poolTeamFeeShare[poolId] = teamFeeShareBps_;
+        registeredTokens[token_] = true;
 
         // Set max approval once to avoid repeated approvals on each swap
         IERC20(token_).approve(address(poolManager), type(uint256).max);
@@ -252,7 +261,11 @@ contract RatchetHook is BaseHook, IRatchetHook, IUnlockCallback, ReentrancyGuard
 
         if (toTeam > 0) {
             (bool success,) = vault.call{value: toTeam}("");
-            require(success, "ETH transfer failed");
+            if (!success) {
+                // If vault transfer fails, return team share to pool fees for retry
+                poolEthFees[poolId] += toTeam;
+                totalPoolEthFees += toTeam;
+            }
         }
 
         // Donate LP ETH to LP via pool manager unlock callback
@@ -300,17 +313,18 @@ contract RatchetHook is BaseHook, IRatchetHook, IUnlockCallback, ReentrancyGuard
         if (amount == 0) revert NoFeesToClaim();
         protocolFeesAccumulated = 0;
 
-        (bool success,) = PROTOCOL_RECIPIENT.call{value: amount}("");
+        (bool success,) = protocolRecipient.call{value: amount}("");
         require(success, "ETH transfer failed");
 
-        emit ProtocolFeeClaimed(PROTOCOL_RECIPIENT, amount);
+        emit ProtocolFeeClaimed(protocolRecipient, amount);
     }
 
     /// @notice Sweep tokens accidentally sent to the hook
-    /// @dev Only callable by PROTOCOL_RECIPIENT. Recovers any ERC20 tokens on this contract.
+    /// @dev Only callable by protocol recipient. Cannot sweep tokens registered to pools.
     /// @param token_ The token to sweep
     /// @param to The recipient address
     function sweepTokens(address token_, address to) external onlyProtocol {
+        if (registeredTokens[token_]) revert RegisteredToken();
         uint256 balance = IERC20(token_).balanceOf(address(this));
         if (balance > 0) {
             IERC20(token_).safeTransfer(to, balance);
@@ -324,9 +338,27 @@ contract RatchetHook is BaseHook, IRatchetHook, IUnlockCallback, ReentrancyGuard
         uint256 balance = address(this).balance;
         if (balance > tracked) {
             uint256 untracked = balance - tracked;
-            (bool success,) = PROTOCOL_RECIPIENT.call{value: untracked}("");
+            (bool success,) = protocolRecipient.call{value: untracked}("");
             require(success, "ETH transfer failed");
         }
+    }
+
+    /// @notice Propose a new protocol recipient (first step of two-step transfer)
+    /// @dev Only callable by current protocol recipient
+    /// @param newRecipient The proposed new protocol recipient
+    function proposeProtocolTransfer(address newRecipient) external onlyProtocol {
+        if (newRecipient == address(0)) revert ZeroAddress();
+        pendingProtocolRecipient = newRecipient;
+        emit ProtocolTransferProposed(protocolRecipient, newRecipient);
+    }
+
+    /// @notice Accept the protocol recipient role (second step of two-step transfer)
+    /// @dev Only callable by the pending protocol recipient
+    function acceptProtocolTransfer() external {
+        if (msg.sender != pendingProtocolRecipient) revert OnlyPendingRecipient();
+        emit ProtocolTransferAccepted(protocolRecipient, msg.sender);
+        protocolRecipient = msg.sender;
+        pendingProtocolRecipient = address(0);
     }
 
     /// @notice Accept ETH but require explicit pool association via depositFees

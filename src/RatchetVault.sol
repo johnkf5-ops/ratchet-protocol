@@ -3,13 +3,14 @@ pragma solidity ^0.8.26;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {IRatchetVault} from "./interfaces/IRatchetVault.sol";
 
 /// @title RatchetVault
 /// @notice Holds team token allocation and sells reactively into buys
 /// @dev The reactive sell rate can only decrease (ratchet down), never increase.
 ///      This creates a one-way commitment mechanism for the team.
-contract RatchetVault is IRatchetVault {
+contract RatchetVault is IRatchetVault, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     /// @notice Maximum reactive sell rate (10% = 1000 bps)
@@ -17,18 +18,15 @@ contract RatchetVault is IRatchetVault {
     uint256 public constant BPS_DENOMINATOR = 10000;
     /// @notice Maximum reactive sell per buy as fraction of vault balance (5%)
     uint256 public constant MAX_SELL_PER_BUY_BPS = 500;
-    /// @notice Time after deployment before unclaimed vaults can be expired
-    uint256 public constant CLAIM_EXPIRY = 90 days;
-
     /// @notice The factory that deployed this vault (can initialize token)
     address public immutable FACTORY;
     /// @notice The hook contract authorized to trigger reactive sells
     address public immutable HOOK;
-    /// @notice Timestamp when vault was deployed
-    uint256 public immutable deployedAt;
 
     /// @notice The team address that receives ETH fees and controls the ratchet
     address private teamRecipient_;
+    /// @notice Pending team recipient for two-step transfer
+    address public pendingTeamRecipient;
     /// @notice The creator identifier string
     string public creator;
     /// @notice Whether the vault has been claimed by its creator
@@ -54,8 +52,9 @@ contract RatchetVault is IRatchetVault {
     error AlreadyInitialized();
     error ZeroAddress();
     error NotYetClaimed();
-    error ClaimNotExpired();
     error AlreadyClaimed();
+    error OnlyPendingTeam();
+    error NoPendingTransfer();
 
     modifier onlyHook() {
         _checkHook();
@@ -92,7 +91,6 @@ contract RatchetVault is IRatchetVault {
 
         FACTORY = msg.sender;
         HOOK = hook_;
-        deployedAt = block.timestamp;
         teamRecipient_ = teamRecipient__;
         reactiveSellRate = initialReactiveSellRate_;
         creator = creator_;
@@ -155,7 +153,7 @@ contract RatchetVault is IRatchetVault {
     }
 
     /// @notice Withdraw accumulated ETH fees to team recipient
-    function claimFees() external onlyTeam {
+    function claimFees() external onlyTeam nonReentrant {
         if (!claimed) revert NotYetClaimed();
         uint256 fees = accumulatedFees;
         if (fees == 0) revert NoFeesToClaim();
@@ -181,13 +179,23 @@ contract RatchetVault is IRatchetVault {
         emit CreatorClaimed(address(this), newRecipient);
     }
 
-    /// @notice Expire an unclaimed vault after the claim period has passed
-    /// @dev Preserves the original teamRecipient, allowing them to claim fees and manage the vault
-    function expireClaim() external {
-        if (claimed) return;
-        if (block.timestamp < deployedAt + CLAIM_EXPIRY) revert ClaimNotExpired();
-        claimed = true;
-        emit ClaimExpired(address(this), teamRecipient_);
+    /// @notice Propose a new team recipient (first step of two-step transfer)
+    /// @dev Only callable by current team recipient. Must be claimed first.
+    /// @param newRecipient The proposed new team recipient
+    function proposeTeamTransfer(address newRecipient) external onlyTeam {
+        if (!claimed) revert NotYetClaimed();
+        if (newRecipient == address(0)) revert ZeroAddress();
+        pendingTeamRecipient = newRecipient;
+        emit TeamTransferProposed(teamRecipient_, newRecipient);
+    }
+
+    /// @notice Accept the team recipient role (second step of two-step transfer)
+    /// @dev Only callable by the pending team recipient
+    function acceptTeamTransfer() external {
+        if (msg.sender != pendingTeamRecipient) revert OnlyPendingTeam();
+        emit TeamTransferAccepted(teamRecipient_, msg.sender);
+        teamRecipient_ = msg.sender;
+        pendingTeamRecipient = address(0);
     }
 
     /// @notice Receive ETH fees from hook

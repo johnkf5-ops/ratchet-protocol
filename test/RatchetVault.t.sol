@@ -356,4 +356,87 @@ contract RatchetVaultTest is Test {
         // (full integration test would require hook deployment with pool manager)
         assertTrue(true);
     }
+
+    // ===== H-1: Two-step team transfer =====
+
+    function test_ProposeAndAcceptTeamTransfer() public {
+        address newTeam = makeAddr("newTeam");
+
+        vm.prank(team);
+        vault.proposeTeamTransfer(newTeam);
+        assertEq(vault.pendingTeamRecipient(), newTeam);
+
+        vm.prank(newTeam);
+        vault.acceptTeamTransfer();
+        assertEq(vault.teamRecipient(), newTeam);
+        assertEq(vault.pendingTeamRecipient(), address(0));
+    }
+
+    function test_ProposeTeamTransferOnlyTeam() public {
+        address attacker = makeAddr("attacker");
+        vm.prank(attacker);
+        vm.expectRevert(RatchetVault.OnlyTeam.selector);
+        vault.proposeTeamTransfer(attacker);
+    }
+
+    function test_ProposeTeamTransferRevertsZeroAddress() public {
+        vm.prank(team);
+        vm.expectRevert(RatchetVault.ZeroAddress.selector);
+        vault.proposeTeamTransfer(address(0));
+    }
+
+    function test_ProposeTeamTransferRevertsWhenUnclaimed() public {
+        RatchetVault unclaimed = new RatchetVault(hook, team, INITIAL_RATE, "creator");
+        unclaimed.initialize(address(token));
+
+        vm.prank(team);
+        vm.expectRevert(RatchetVault.NotYetClaimed.selector);
+        unclaimed.proposeTeamTransfer(makeAddr("newTeam"));
+    }
+
+    function test_AcceptTeamTransferOnlyPending() public {
+        address newTeam = makeAddr("newTeam");
+        vm.prank(team);
+        vault.proposeTeamTransfer(newTeam);
+
+        address attacker = makeAddr("attacker");
+        vm.prank(attacker);
+        vm.expectRevert(RatchetVault.OnlyPendingTeam.selector);
+        vault.acceptTeamTransfer();
+    }
+
+    function test_NewTeamCanClaimFees() public {
+        address newTeam = makeAddr("newTeam");
+
+        // Transfer team role
+        vm.prank(team);
+        vault.proposeTeamTransfer(newTeam);
+        vm.prank(newTeam);
+        vault.acceptTeamTransfer();
+
+        // Send fees
+        vm.deal(hook, 1 ether);
+        vm.prank(hook);
+        (bool success,) = address(vault).call{value: 1 ether}("");
+        require(success);
+
+        // New team claims
+        uint256 balBefore = newTeam.balance;
+        vm.prank(newTeam);
+        vault.claimFees();
+        assertEq(newTeam.balance, balBefore + 1 ether);
+    }
+
+    function test_NewTeamCanDecreaseRate() public {
+        address newTeam = makeAddr("newTeam");
+
+        vm.prank(team);
+        vault.proposeTeamTransfer(newTeam);
+        vm.prank(newTeam);
+        vault.acceptTeamTransfer();
+
+        vm.prank(newTeam);
+        vault.decreaseRate(500);
+        assertEq(vault.reactiveSellRate(), 500);
+    }
 }

@@ -6,7 +6,8 @@ interface IRatchetVault {
     event RatchetDecreased(uint256 oldRate, uint256 newRate);
     event TeamFeeClaimed(address indexed recipient, uint256 amount);
     event CreatorClaimed(address indexed vault, address indexed newOwner);
-    event ClaimExpired(address indexed vault, address indexed teamRecipient);
+    event TeamTransferProposed(address indexed currentRecipient, address indexed proposedRecipient);
+    event TeamTransferAccepted(address indexed oldRecipient, address indexed newRecipient);
 
     /// @notice Current reactive sell rate in basis points (0-1000 = 0-10%)
     function reactiveSellRate() external view returns (uint256);
@@ -27,9 +28,6 @@ interface IRatchetVault {
     /// @param newRecipient The new team recipient address
     function setClaimed(address newRecipient) external;
 
-    /// @notice Expire an unclaimed vault after the claim period has passed
-    function expireClaim() external;
-
     /// @notice Initialize the token address (only factory)
     function initialize(address token_) external;
 
@@ -45,8 +43,18 @@ interface IRatchetVault {
     /// @notice The hook address
     function hook() external view returns (address);
 
+    /// @notice Propose a new team recipient (first step of two-step transfer)
+    /// @param newRecipient The proposed new team recipient
+    function proposeTeamTransfer(address newRecipient) external;
+
+    /// @notice Accept the team recipient role (second step of two-step transfer)
+    function acceptTeamTransfer() external;
+
     /// @notice The team recipient address
     function teamRecipient() external view returns (address);
+
+    /// @notice Pending team recipient for two-step transfer
+    function pendingTeamRecipient() external view returns (address);
 
     /// @notice ETH fees accumulated from hook
     function accumulatedFees() external view returns (uint256);
@@ -56,7 +64,4 @@ interface IRatchetVault {
 
     /// @notice The hook contract authorized to trigger reactive sells
     function HOOK() external view returns (address);
-
-    /// @notice Timestamp when vault was deployed
-    function deployedAt() external view returns (uint256);
 }

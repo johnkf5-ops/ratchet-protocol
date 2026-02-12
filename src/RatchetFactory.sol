@@ -41,6 +41,8 @@ contract RatchetFactory is IRatchetFactory {
     uint256 public constant MAX_TOTAL_SUPPLY = type(uint128).max;
     /// @notice Maximum team fee share (50%)
     uint256 public constant MAX_TEAM_FEE_SHARE = 5000;
+    /// @notice Minimum ETH required for initial liquidity
+    uint256 public constant MIN_INITIAL_ETH = 0.001 ether;
     /// @notice Address to burn LP tokens (dead address)
     address public constant BURN_ADDRESS = 0x000000000000000000000000000000000000dEaD;
 
@@ -71,7 +73,7 @@ contract RatchetFactory is IRatchetFactory {
 
     error TeamAllocationTooHigh();
     error ReactiveSellRateTooHigh();
-    error InsufficientETH();
+    error InsufficientETH(uint256 sent, uint256 minimum);
     error RefundFailed();
     error InvalidHook();
     error OnlyVerifier();
@@ -100,9 +102,13 @@ contract RatchetFactory is IRatchetFactory {
         RatchetHook hook_,
         address verifier_
     ) {
-        // Validate hook has correct permissions encoded in address
+        // Validate no zero addresses
+        if (address(poolManager_) == address(0)) revert ZeroAddress();
+        if (address(positionManager_) == address(0)) revert ZeroAddress();
+        if (address(permit2_) == address(0)) revert ZeroAddress();
+        if (address(weth_) == address(0)) revert ZeroAddress();
         if (address(hook_) == address(0)) revert InvalidHook();
-        // The hook's constructor validates its own address flags via validateHookPermissions
+        if (verifier_ == address(0)) revert ZeroAddress();
 
         POOL_MANAGER = poolManager_;
         POSITION_MANAGER = positionManager_;
@@ -128,7 +134,7 @@ contract RatchetFactory is IRatchetFactory {
         if (params.teamAllocationBps > MAX_TEAM_ALLOCATION) revert TeamAllocationTooHigh();
         if (params.initialReactiveSellRate > MAX_REACTIVE_SELL_RATE) revert ReactiveSellRateTooHigh();
         if (params.teamFeeShareBps > MAX_TEAM_FEE_SHARE) revert TeamFeeShareTooHigh();
-        if (msg.value == 0) revert InsufficientETH();
+        if (msg.value < MIN_INITIAL_ETH) revert InsufficientETH(msg.value, MIN_INITIAL_ETH);
 
         // Track ETH balance before operations
         uint256 ethBefore = address(this).balance - msg.value;
