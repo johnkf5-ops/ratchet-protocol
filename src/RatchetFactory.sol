@@ -204,11 +204,19 @@ contract RatchetFactory is IRatchetFactory, ReentrancyGuard {
         // Register pool with hook before initialization (include token position for buy detection)
         HOOK.registerPool(key, address(token), address(vault), tokenIsCurrency0, params.teamFeeShareBps);
 
-        // Initialize pool at specified price
-        POOL_MANAGER.initialize(key, params.initialSqrtPriceX96);
+        // Correct sqrtPriceX96 for currency ordering.
+        // The caller computes sqrtPriceX96 = sqrt(token/ETH) * 2^96 (assuming WETH is currency0).
+        // When token < WETH, currencies are swapped so we need sqrt(ETH/token) * 2^96 = 2^192 / input.
+        uint160 sqrtPriceX96 = params.initialSqrtPriceX96;
+        if (tokenIsCurrency0) {
+            sqrtPriceX96 = uint160((uint256(1) << 192) / uint256(params.initialSqrtPriceX96));
+        }
+
+        // Initialize pool at corrected price
+        POOL_MANAGER.initialize(key, sqrtPriceX96);
 
         // Add liquidity and burn LP position
-        _addInitialLiquidity(key, lpSupply, params.initialSqrtPriceX96);
+        _addInitialLiquidity(key, lpSupply, sqrtPriceX96);
 
         // Refund leftover tokens to launcher (position may not use all lpSupply)
         uint256 remainingTokens = IERC20(address(token)).balanceOf(address(this));
