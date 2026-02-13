@@ -6,18 +6,21 @@ import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 interface IRatchetHook {
     event PoolInitialized(PoolKey key, address token, address vault);
     event FeesDeposited(bytes32 indexed poolId, address indexed sender, uint256 amount);
-    event FeesRouted(bytes32 indexed poolId, uint256 ethToTeam, uint256 ethToLp);
+    event FeesRouted(bytes32 indexed poolId, uint256 ethToLp);
     event ProtocolFeeClaimed(address recipient, uint256 amount);
-    event ProtocolTransferProposed(address indexed currentRecipient, address indexed proposedRecipient);
-    event ProtocolTransferAccepted(address indexed oldRecipient, address indexed newRecipient);
+    event ProtocolTransferProposed(
+        address indexed currentRecipient, address indexed proposedRecipient
+    );
+    event ProtocolTransferAccepted(
+        address indexed oldRecipient, address indexed newRecipient
+    );
 
     /// @notice Register a new pool with its vault (only factory)
     function registerPool(
         PoolKey calldata key,
         address token_,
         address vault,
-        bool tokenIsCurrency0_,
-        uint256 teamFeeShareBps_
+        bool tokenIsCurrency0_
     ) external;
 
     /// @notice Deposit ETH fees for a specific pool
@@ -40,18 +43,6 @@ interface IRatchetHook {
 
     /// @notice Accept the protocol recipient role (second step of two-step transfer)
     function acceptProtocolTransfer() external;
-
-    /// @notice Retry sending pending ETH fees to a vault (bypasses protocol fee)
-    function retryVaultFees(address vault) external;
-
-    /// @notice Pending ETH fees for a vault after failed transfers
-    function vaultPendingFees(address vault) external view returns (uint256);
-
-    /// @notice Total vault pending fees across all vaults
-    function totalVaultPendingFees() external view returns (uint256);
-
-    /// @notice Fee share to team in basis points for a specific pool
-    function poolTeamFeeShare(bytes32 poolId) external view returns (uint256);
 
     /// @notice Get the vault associated with a pool
     function poolVaults(bytes32 poolId) external view returns (address);

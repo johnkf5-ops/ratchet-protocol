@@ -19,27 +19,9 @@ contract LaunchTokenScript is Script {
         uint256 totalSupply = 1_000_000_000 * 1e18; // 1 billion tokens
         uint256 teamAllocationBps = 1000; // 10%
         uint256 initialReactiveSellRate = 500; // 5%
-        uint256 teamFeeShareBps = 500; // 5% of ETH fees to team
 
         // Initial price calculation:
         // We want 1 ETH = 1,000,000 tokens (each token = 0.000001 ETH)
-        //
-        // In Uniswap, sqrtPriceX96 = sqrt(price) * 2^96
-        // where price = token1/token0
-        //
-        // WETH on Base: 0x4200000000000000000000000000000000000006
-        // New tokens typically have higher addresses, so:
-        //   - WETH is likely token0
-        //   - Our token is likely token1
-        //   - price = token/WETH = 1,000,000
-        //   - sqrtPrice = sqrt(1,000,000) = 1000
-        //   - sqrtPriceX96 = 1000 * 2^96
-        //
-        // 2^96 = 79228162514264337593543950336
-        // sqrtPriceX96 = 1000 * 2^96 = 79228162514264337593543950336000
-        //
-        // However, if token address < WETH, the ratio is inverted.
-        // Using a moderate price that works for full-range liquidity:
         uint160 initialSqrtPriceX96 = 79228162514264337593543950336 * 1000; // 1 ETH = 1M tokens
 
         uint256 ethForLiquidity = 0.001 ether;
@@ -63,7 +45,6 @@ contract LaunchTokenScript is Script {
             totalSupply: totalSupply,
             teamAllocationBps: teamAllocationBps,
             initialReactiveSellRate: initialReactiveSellRate,
-            teamFeeShareBps: teamFeeShareBps,
             initialSqrtPriceX96: initialSqrtPriceX96,
             creator: ""
         });
@@ -77,6 +58,7 @@ contract LaunchTokenScript is Script {
         console.log("Deployed Contracts:");
         console.log("  Token:", result.token);
         console.log("  Vault:", result.vault);
+        console.log("  Staking:", result.staking);
         console.log("  Pool ID:", vm.toString(result.poolId));
         console.log("");
         console.log("Token Distribution:");

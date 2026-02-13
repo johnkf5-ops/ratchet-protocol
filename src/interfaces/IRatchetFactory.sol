@@ -7,7 +7,6 @@ struct LaunchParams {
     uint256 totalSupply;
     uint256 teamAllocationBps; // Basis points for team vault (e.g., 1000 = 10%)
     uint256 initialReactiveSellRate; // Initial reactive sell rate in bps (max 1000 = 10%)
-    uint256 teamFeeShareBps; // Team's share of ETH fees in bps (max 5000 = 50%)
     uint160 initialSqrtPriceX96; // Initial price for the pool
     string creator; // Creator identifier (empty string = auto-claim to msg.sender)
 }
@@ -15,6 +14,7 @@ struct LaunchParams {
 struct LaunchResult {
     address token;
     address vault;
+    address staking;
     bytes32 poolId;
 }
 
@@ -37,7 +37,10 @@ interface IRatchetFactory {
     /// @notice Launch a new token with Ratchet mechanism
     /// @param params Launch parameters
     /// @return result Addresses of deployed contracts and pool ID
-    function launch(LaunchParams calldata params) external payable returns (LaunchResult memory result);
+    function launch(LaunchParams calldata params)
+        external
+        payable
+        returns (LaunchResult memory result);
 
     /// @notice Verify and claim a vault for a creator (only verifier)
     /// @param vault The vault to claim
@@ -59,6 +62,9 @@ interface IRatchetFactory {
 
     /// @notice Whether a vault was deployed by this factory
     function deployedVaults(address vault) external view returns (bool);
+
+    /// @notice Get the staking contract associated with a vault
+    function vaultStaking(address vault) external view returns (address);
 
     /// @notice Sweep tokens accidentally sent to the factory (only verifier)
     function sweepTokens(address token_, address to) external;

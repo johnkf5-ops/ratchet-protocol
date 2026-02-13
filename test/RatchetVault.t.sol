@@ -19,20 +19,14 @@ contract RatchetVaultTest is Test {
 
     function setUp() public {
         // Deploy vault first (no token needed in constructor)
-        // Pass empty creator string to trigger auto-claim path
         vault = new RatchetVault(hook, team, INITIAL_RATE, "");
 
         // Deploy token - it mints to vault
         token = new RatchetToken(
-            "Test Token",
-            "TEST",
-            LP_SUPPLY,
-            VAULT_SUPPLY,
-            address(this),
-            address(vault)
+            "Test Token", "TEST", LP_SUPPLY, VAULT_SUPPLY, address(this), address(vault)
         );
 
-        // Initialize vault with token address
+        // Initialize vault with token address (sets vaultStartingBalance)
         vault.initialize(address(token));
 
         // Auto-claim: test contract acts as factory
@@ -46,12 +40,29 @@ contract RatchetVaultTest is Test {
         assertEq(vault.token(), address(token));
     }
 
-    function test_ReactiveSell() public {
-        // Vault should already have VAULT_SUPPLY tokens from deployment
-        assertEq(token.balanceOf(address(vault)), VAULT_SUPPLY);
+    function test_initializeSetsStartingBalance() public view {
+        assertEq(vault.vaultStartingBalance(), VAULT_SUPPLY);
+    }
 
+    function test_sellBasedOnBuyAmountWithRate() public {
         uint256 buyAmount = 10_000e18;
-        uint256 expectedSell = (buyAmount * INITIAL_RATE) / 10000; // 10% of buy
+        uint256 expectedSell = (buyAmount * INITIAL_RATE) / 10000; // 10% of buy = 1000e18
+        // But capped at per-trigger max: 0.1% of 100_000e18 = 100e18
+        uint256 maxTrigger = (VAULT_SUPPLY * 10) / 10000;
+
+        vm.prank(hook);
+        uint256 sellAmount = vault.onBuy(buyAmount);
+
+        // Since expectedSell (1000e18) > maxTrigger (100e18), it should be capped
+        assertEq(sellAmount, maxTrigger);
+    }
+
+    function test_ReactiveSell() public {
+        // Use a small buy so per-trigger cap doesn't kick in
+        // Per-trigger cap: 0.1% of 100,000e18 = 100e18
+        // At 10% rate, buyAmount of 500e18 → sell = 50e18 (within cap)
+        uint256 buyAmount = 500e18;
+        uint256 expectedSell = (buyAmount * INITIAL_RATE) / 10000; // 50e18
 
         vm.prank(hook);
         uint256 sellAmount = vault.onBuy(buyAmount);
@@ -62,7 +73,7 @@ contract RatchetVaultTest is Test {
     }
 
     function test_RatchetDecrease() public {
-        uint256 newRate = 500; // 5%
+        uint256 newRate = 500;
 
         vm.prank(team);
         vault.decreaseRate(newRate);
@@ -71,11 +82,9 @@ contract RatchetVaultTest is Test {
     }
 
     function test_RatchetCannotIncrease() public {
-        // First decrease
         vm.prank(team);
         vault.decreaseRate(500);
 
-        // Try to increase - should revert
         vm.prank(team);
         vm.expectRevert(RatchetVault.RateCanOnlyDecrease.selector);
         vault.decreaseRate(600);
@@ -93,32 +102,7 @@ contract RatchetVaultTest is Test {
         vault.decreaseRate(500);
     }
 
-    function test_ClaimFees() public {
-        // Send ETH to vault via receive() (must come from hook)
-        vm.deal(hook, 1 ether);
-        vm.prank(hook);
-        (bool success,) = address(vault).call{value: 1 ether}("");
-        require(success, "ETH send failed");
-
-        assertEq(vault.accumulatedFees(), 1 ether);
-
-        uint256 teamBalanceBefore = team.balance;
-
-        vm.prank(team);
-        vault.claimFees();
-
-        assertEq(team.balance, teamBalanceBefore + 1 ether);
-        assertEq(vault.accumulatedFees(), 0);
-    }
-
-    function test_ClaimFeesRevertsWhenNoFees() public {
-        vm.prank(team);
-        vm.expectRevert(RatchetVault.NoFeesToClaim.selector);
-        vault.claimFees();
-    }
-
     function test_ZeroRateMeansNoSell() public {
-        // Decrease rate to zero
         vm.prank(team);
         vault.decreaseRate(0);
 
@@ -128,31 +112,14 @@ contract RatchetVaultTest is Test {
         assertEq(sellAmount, 0);
     }
 
-    function test_SellCappedByBalance() public {
-        // Try to trigger a sell larger than vault balance
-        // buyAmount * 10% rate = 1,000,000e18 which exceeds VAULT_SUPPLY (100,000e18)
-        // Capped first at balance (100,000e18), then at per-block cap (5% of 100,000e18 = 5,000e18)
-        uint256 hugeAmount = VAULT_SUPPLY * 100;
-        uint256 expectedSell = (VAULT_SUPPLY * 500) / 10000; // MAX_SELL_PER_BUY_BPS cap
-
-        vm.prank(hook);
-        uint256 sellAmount = vault.onBuy(hugeAmount);
-
-        assertEq(sellAmount, expectedSell);
-        assertEq(token.balanceOf(address(vault)), VAULT_SUPPLY - expectedSell);
-    }
-
     function test_InitializeOnlyOnce() public {
-        // Try to initialize again - should revert
         vm.expectRevert(RatchetVault.AlreadyInitialized.selector);
         vault.initialize(address(token));
     }
 
     function test_InitializeOnlyByFactory() public {
-        // Deploy new vault
         RatchetVault newVault = new RatchetVault(hook, team, INITIAL_RATE, "");
 
-        // Try to initialize from a different address
         vm.prank(team);
         vm.expectRevert(RatchetVault.OnlyFactory.selector);
         newVault.initialize(address(token));
@@ -170,10 +137,159 @@ contract RatchetVaultTest is Test {
         newVault.initialize(address(0));
     }
 
-    // ===== New tests for creator mechanic =====
+    // ===== Per-trigger cap tests =====
+
+    function test_onBuy_capsAt0Point1PercentPerTrigger() public {
+        // Per-trigger cap: 0.1% of 100,000e18 = 100e18
+        // With 10% rate and large buy: sellAmount would be large but capped at 100e18
+        uint256 buyAmount = 100_000e18;
+        uint256 maxTrigger = (VAULT_SUPPLY * 10) / 10000; // 100e18
+
+        vm.prank(hook);
+        uint256 sellAmount = vault.onBuy(buyAmount);
+
+        assertEq(sellAmount, maxTrigger, "Should be capped at 0.1% per trigger");
+    }
+
+    // ===== Daily cap tests =====
+
+    function test_onBuy_dailyCapAt0Point135Percent() public {
+        // Daily cap: 0.135% of 100,000e18 = 135e18
+        // Per-trigger cap: 0.1% of 100,000e18 = 100e18
+        // First trigger: 100e18, second trigger: 35e18 (daily cap - first)
+        uint256 buyAmount = 100_000e18;
+        uint256 maxTrigger = (VAULT_SUPPLY * 10) / 10000; // 100e18
+        uint256 maxDaily = (VAULT_SUPPLY * 135) / 100_000; // 135e18
+
+        vm.prank(hook);
+        uint256 sell1 = vault.onBuy(buyAmount);
+        assertEq(sell1, maxTrigger);
+
+        vm.prank(hook);
+        uint256 sell2 = vault.onBuy(buyAmount);
+        assertEq(sell2, maxDaily - maxTrigger, "Second sell should be capped by daily remaining");
+
+        // Third trigger should give 0
+        vm.prank(hook);
+        uint256 sell3 = vault.onBuy(buyAmount);
+        assertEq(sell3, 0, "Third sell should be 0 (daily cap hit)");
+    }
+
+    function test_onBuy_dailyResets() public {
+        uint256 buyAmount = 100_000e18;
+        uint256 maxTrigger = (VAULT_SUPPLY * 10) / 10000; // 100e18
+        uint256 maxDaily = (VAULT_SUPPLY * 135) / 100_000; // 135e18
+
+        // Exhaust daily cap
+        vm.prank(hook);
+        vault.onBuy(buyAmount);
+        vm.prank(hook);
+        vault.onBuy(buyAmount);
+
+        // Warp to next day
+        vm.warp(block.timestamp + 1 days);
+
+        // Should be able to sell again
+        vm.prank(hook);
+        uint256 sellAmount = vault.onBuy(buyAmount);
+        assertEq(sellAmount, maxTrigger, "Daily cap should reset on new day");
+
+        // Verify dailySold is reset
+        assertEq(vault.dailySold(), maxTrigger);
+    }
+
+    // ===== Shutoff threshold tests =====
+
+    function test_onBuy_shutoffAt1Percent() public {
+        // Use deal to set vault balance near the shutoff threshold
+        // Starting balance: VAULT_SUPPLY = 100,000e18
+        // Shutoff reserve: 1% = 1,000e18
+        uint256 shutoffReserve = (VAULT_SUPPLY * 100) / 10000; // 1,000e18
+
+        // Set vault balance to just above shutoff (1,050e18)
+        deal(address(token), address(vault), shutoffReserve + 50e18);
+
+        // Next buy should sell some but then trigger shutoff
+        // Per-trigger cap: 0.1% of 100,000e18 = 100e18 > remaining above reserve (50e18)
+        // So sell is capped at 50e18 and vault finishes
+        vm.warp(block.timestamp + 1 days);
+        vm.prank(hook);
+        uint256 sold = vault.onBuy(100_000e18);
+
+        assertEq(sold, 50e18, "Should sell exactly the amount above reserve");
+        assertTrue(vault.vaultFinished(), "Vault should be finished");
+
+        // Verify no more selling
+        vm.warp(block.timestamp + 1 days);
+        vm.prank(hook);
+        uint256 sold2 = vault.onBuy(100_000e18);
+        assertEq(sold2, 0, "Should not sell after finished");
+    }
+
+    function test_onBuy_shutoffTriggeredWhenBalanceAtReserve() public {
+        // Set balance to exactly the shutoff reserve
+        uint256 shutoffReserve = (VAULT_SUPPLY * 100) / 10000; // 1,000e18
+        deal(address(token), address(vault), shutoffReserve);
+
+        vm.warp(block.timestamp + 1 days);
+        vm.prank(hook);
+        uint256 sold = vault.onBuy(100_000e18);
+
+        // balance <= shutoffReserve → sets vaultFinished, returns 0
+        assertEq(sold, 0);
+        assertTrue(vault.vaultFinished());
+    }
+
+    function test_onBuy_returnsZeroWhenFinished() public {
+        // Set vault to near shutoff so it finishes
+        uint256 shutoffReserve = (VAULT_SUPPLY * 100) / 10000;
+        deal(address(token), address(vault), shutoffReserve + 10e18);
+
+        vm.warp(block.timestamp + 1 days);
+        vm.prank(hook);
+        vault.onBuy(100_000e18); // This sells 10e18 and sets vaultFinished
+
+        assertTrue(vault.vaultFinished());
+
+        // Now any buy should return 0
+        vm.warp(block.timestamp + 1 days);
+        vm.prank(hook);
+        uint256 sellAmount = vault.onBuy(100_000e18);
+        assertEq(sellAmount, 0, "Finished vault should always return 0");
+    }
+
+    // ===== Release final tokens tests =====
+
+    function test_releaseFinalTokens() public {
+        // Set vault to near shutoff so it finishes
+        uint256 shutoffReserve = (VAULT_SUPPLY * 100) / 10000; // 1,000e18
+        deal(address(token), address(vault), shutoffReserve + 10e18);
+
+        vm.warp(block.timestamp + 1 days);
+        vm.prank(hook);
+        vault.onBuy(100_000e18); // sells 10e18, vault finishes
+
+        assertTrue(vault.vaultFinished());
+        uint256 remaining = token.balanceOf(address(vault));
+        assertEq(remaining, shutoffReserve, "Should have shutoff reserve remaining");
+
+        uint256 teamBefore = token.balanceOf(team);
+        vm.prank(team);
+        vault.releaseFinalTokens();
+
+        assertEq(token.balanceOf(team), teamBefore + remaining);
+        assertEq(token.balanceOf(address(vault)), 0);
+    }
+
+    function test_releaseFinalTokens_revertsBeforeFinished() public {
+        vm.prank(team);
+        vm.expectRevert(RatchetVault.VaultNotFinished.selector);
+        vault.releaseFinalTokens();
+    }
+
+    // ===== Creator mechanic tests =====
 
     function test_NotYetClaimedBlocksDecreaseRate() public {
-        // Deploy unclaimed vault
         RatchetVault unclaimed = new RatchetVault(hook, team, INITIAL_RATE, "someCreator");
         unclaimed.initialize(address(token));
 
@@ -182,24 +298,7 @@ contract RatchetVaultTest is Test {
         unclaimed.decreaseRate(500);
     }
 
-    function test_NotYetClaimedBlocksClaimFees() public {
-        // Deploy unclaimed vault
-        RatchetVault unclaimed = new RatchetVault(hook, team, INITIAL_RATE, "someCreator");
-        unclaimed.initialize(address(token));
-
-        // Send ETH to accumulate fees (must come from hook)
-        vm.deal(hook, 1 ether);
-        vm.prank(hook);
-        (bool success,) = address(unclaimed).call{value: 1 ether}("");
-        require(success, "ETH send failed");
-
-        vm.prank(team);
-        vm.expectRevert(RatchetVault.NotYetClaimed.selector);
-        unclaimed.claimFees();
-    }
-
     function test_SetClaimedByFactory() public {
-        // Deploy unclaimed vault (this contract is factory)
         RatchetVault unclaimed = new RatchetVault(hook, team, INITIAL_RATE, "someCreator");
         unclaimed.initialize(address(token));
 
@@ -219,41 +318,30 @@ contract RatchetVaultTest is Test {
     }
 
     function test_SetClaimedRevertsIfAlreadyClaimed() public {
-        // Deploy unclaimed vault (this contract is factory)
         RatchetVault unclaimed = new RatchetVault(hook, team, INITIAL_RATE, "someCreator");
         unclaimed.initialize(address(token));
 
-        // First claim succeeds
         address owner1 = makeAddr("owner1");
         unclaimed.setClaimed(owner1);
         assertTrue(unclaimed.claimed());
 
-        // Second claim reverts
         address owner2 = makeAddr("owner2");
         vm.expectRevert(RatchetVault.AlreadyClaimed.selector);
         unclaimed.setClaimed(owner2);
 
-        // Original owner is preserved
         assertEq(unclaimed.teamRecipient(), owner1);
     }
 
     function test_OnBuyWorksWhenUnclaimed() public {
-        // Deploy unclaimed vault with this contract as factory
         RatchetVault unclaimed = new RatchetVault(hook, team, INITIAL_RATE, "someCreator");
 
-        // Deploy a separate token that mints to this unclaimed vault
         RatchetToken token2 = new RatchetToken(
-            "Test Token 2",
-            "TEST2",
-            LP_SUPPLY,
-            VAULT_SUPPLY,
-            address(this),
-            address(unclaimed)
+            "Test Token 2", "TEST2", LP_SUPPLY, VAULT_SUPPLY, address(this), address(unclaimed)
         );
         unclaimed.initialize(address(token2));
 
-        // Reactive sell should work even when unclaimed
-        uint256 buyAmount = 10_000e18;
+        // Use small buy to stay within per-trigger cap
+        uint256 buyAmount = 500e18;
         uint256 expectedSell = (buyAmount * INITIAL_RATE) / 10000;
 
         vm.prank(hook);
@@ -267,97 +355,7 @@ contract RatchetVaultTest is Test {
         assertEq(v.creator(), "myCreatorHandle");
     }
 
-    function test_ClaimFeesGoesToNewRecipient() public {
-        // Deploy vault, claim to a different address
-        RatchetVault v = new RatchetVault(hook, team, INITIAL_RATE, "creator123");
-        v.initialize(address(token));
-
-        address newRecipient = makeAddr("newRecipient");
-        v.setClaimed(newRecipient);
-
-        // Send ETH to accumulate fees (must come from hook)
-        vm.deal(hook, 2 ether);
-        vm.prank(hook);
-        (bool success,) = address(v).call{value: 2 ether}("");
-        require(success, "ETH send failed");
-
-        uint256 balBefore = newRecipient.balance;
-
-        vm.prank(newRecipient);
-        v.claimFees();
-
-        assertEq(newRecipient.balance, balBefore + 2 ether);
-        assertEq(v.accumulatedFees(), 0);
-    }
-
-    // ===== New tests for protocol fees =====
-
-    function test_ProtocolFeesSplit() public {
-        // We test the hook's routeFees split logic using a mock-style approach
-        // Deploy a mock hook to test fee splitting
-        // For simplicity, test the math directly:
-        // ethFees = 1 ether
-        // protocolFee = 1 ether * 2000 / 10000 = 0.2 ether
-        // remaining = 0.8 ether
-        // toTeam = 0.8 ether * teamFeeShare / 10000
-
-        uint256 ethFees = 1 ether;
-        uint256 protocolFeeBps = 2000;
-        uint256 bpsDenom = 10000;
-        uint256 teamFeeShareBps = 500; // 5%
-
-        uint256 protocolFee = (ethFees * protocolFeeBps) / bpsDenom;
-        uint256 remaining = ethFees - protocolFee;
-        uint256 toTeam = (remaining * teamFeeShareBps) / bpsDenom;
-
-        assertEq(protocolFee, 0.2 ether);
-        assertEq(remaining, 0.8 ether);
-        assertEq(toTeam, 0.04 ether); // 5% of 0.8 = 0.04
-    }
-
-    function test_ClaimProtocolFees() public {
-        // Test that protocolFeesAccumulated can be claimed
-        // This is a unit-level check of the accumulation pattern
-        uint256 ethFees = 1 ether;
-        uint256 protocolFeeBps = 2000;
-        uint256 bpsDenom = 10000;
-
-        uint256 protocolFee = (ethFees * protocolFeeBps) / bpsDenom;
-        assertEq(protocolFee, 0.2 ether);
-
-        // The protocol fee should be 20% of total fees
-        assertEq(protocolFee * 5, ethFees);
-    }
-
-    function test_PerBlockSellCap() public {
-        // Multiple buys in the same block should be capped cumulatively
-        uint256 buyAmount = 10_000e18;
-        // At 10% rate: sellAmount = 1,000e18
-        // maxBlockSell = VAULT_SUPPLY * 500 / 10000 = 5,000e18
-        // First buy: 1,000e18 (cumulative: 1,000e18) - within cap
-        // Second buy: 1,000e18 (cumulative: 2,000e18) - within cap
-        // ...up to 5 buys before hitting cap
-
-        uint256 totalSold;
-        for (uint256 i = 0; i < 10; i++) {
-            vm.prank(hook);
-            uint256 sold = vault.onBuy(buyAmount);
-            totalSold += sold;
-        }
-
-        // Should be capped at 5% of vault balance = 5,000e18
-        uint256 maxBlockSell = (VAULT_SUPPLY * 500) / 10000;
-        assertEq(totalSold, maxBlockSell);
-    }
-
-    function test_ClaimProtocolFeesRevertsForNonRecipient() public {
-        // Verify the OnlyProtocol pattern works correctly
-        // This test validates the access control concept
-        // (full integration test would require hook deployment with pool manager)
-        assertTrue(true);
-    }
-
-    // ===== H-1: Two-step team transfer =====
+    // ===== Two-step team transfer =====
 
     function test_ProposeAndAcceptTeamTransfer() public {
         address newTeam = makeAddr("newTeam");
@@ -403,28 +401,6 @@ contract RatchetVaultTest is Test {
         vm.prank(attacker);
         vm.expectRevert(RatchetVault.OnlyPendingTeam.selector);
         vault.acceptTeamTransfer();
-    }
-
-    function test_NewTeamCanClaimFees() public {
-        address newTeam = makeAddr("newTeam");
-
-        // Transfer team role
-        vm.prank(team);
-        vault.proposeTeamTransfer(newTeam);
-        vm.prank(newTeam);
-        vault.acceptTeamTransfer();
-
-        // Send fees
-        vm.deal(hook, 1 ether);
-        vm.prank(hook);
-        (bool success,) = address(vault).call{value: 1 ether}("");
-        require(success);
-
-        // New team claims
-        uint256 balBefore = newTeam.balance;
-        vm.prank(newTeam);
-        vault.claimFees();
-        assertEq(newTeam.balance, balBefore + 1 ether);
     }
 
     function test_NewTeamCanDecreaseRate() public {

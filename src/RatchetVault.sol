@@ -3,27 +3,34 @@ pragma solidity ^0.8.26;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {IRatchetVault} from "./interfaces/IRatchetVault.sol";
 
 /// @title RatchetVault
 /// @notice Holds team token allocation and sells reactively into buys
 /// @dev The reactive sell rate can only decrease (ratchet down), never increase.
-///      This creates a one-way commitment mechanism for the team.
-contract RatchetVault is IRatchetVault, ReentrancyGuard {
+///      Vault sells are capped at 0.1% per trigger and 0.135% per day of starting balance.
+///      When <=1% of starting balance remains, selling stops permanently.
+contract RatchetVault is IRatchetVault {
     using SafeERC20 for IERC20;
 
     /// @notice Maximum reactive sell rate (10% = 1000 bps)
     uint256 public constant MAX_REACTIVE_SELL_RATE = 1000;
     uint256 public constant BPS_DENOMINATOR = 10000;
-    /// @notice Maximum reactive sell per buy as fraction of vault balance (5%)
-    uint256 public constant MAX_SELL_PER_BUY_BPS = 500;
+    /// @notice Maximum sell per trigger: 0.1% of starting balance
+    uint256 public constant MAX_SELL_PER_TRIGGER_BPS = 10;
+    /// @notice Maximum daily sell rate numerator: 0.135%
+    uint256 public constant MAX_DAILY_RATE = 135;
+    /// @notice Denominator for daily rate: 0.001% precision
+    uint256 public constant RATE_DENOMINATOR = 100_000;
+    /// @notice Shutoff threshold: 1% of starting balance
+    uint256 public constant SHUTOFF_THRESHOLD_BPS = 100;
+
     /// @notice The factory that deployed this vault (can initialize token)
     address public immutable FACTORY;
     /// @notice The hook contract authorized to trigger reactive sells
     address public immutable HOOK;
 
-    /// @notice The team address that receives ETH fees and controls the ratchet
+    /// @notice The team address that receives tokens and controls the ratchet
     address private teamRecipient_;
     /// @notice Pending team recipient for two-step transfer
     address public pendingTeamRecipient;
@@ -36,25 +43,31 @@ contract RatchetVault is IRatchetVault, ReentrancyGuard {
     address public TOKEN;
     /// @notice Current reactive sell rate in basis points (0-1000)
     uint256 public reactiveSellRate;
-    /// @notice ETH fees accumulated from hook, claimable by team
-    uint256 public accumulatedFees;
-    /// @notice Last block number when a reactive sell occurred (for per-block cap)
-    uint256 private lastSellBlock;
-    /// @notice Cumulative sell amount in the current block
-    uint256 private blockSellAmount;
+
+    /// @notice The starting token balance of the vault (set on initialize)
+    uint256 public vaultStartingBalance;
+    /// @notice Cumulative tokens sold from the vault
+    uint256 public totalSold;
+    /// @notice Whether the vault has finished selling (<=1% remaining)
+    bool public vaultFinished;
+    /// @notice The day number (block.timestamp / 1 days) of the last sell
+    uint256 public lastSellDay;
+    /// @notice Cumulative tokens sold within the current day
+    uint256 public dailySold;
 
     error OnlyHook();
     error OnlyTeam();
     error OnlyFactory();
     error RateCanOnlyDecrease();
     error RateTooHigh();
-    error NoFeesToClaim();
     error AlreadyInitialized();
     error ZeroAddress();
     error NotYetClaimed();
     error AlreadyClaimed();
     error OnlyPendingTeam();
     error NoPendingTransfer();
+    error VaultAlreadyFinished();
+    error VaultNotFinished();
 
     modifier onlyHook() {
         _checkHook();
@@ -76,7 +89,7 @@ contract RatchetVault is IRatchetVault, ReentrancyGuard {
 
     /// @notice Deploy a new vault for a token launch
     /// @param hook_ The hook contract authorized to call onBuy
-    /// @param teamRecipient__ Address that can decrease rate and claim fees
+    /// @param teamRecipient__ Address that can decrease rate and release final tokens
     /// @param initialReactiveSellRate_ Starting sell rate in bps (max 1000 = 10%)
     /// @param creator_ Creator identifier string
     constructor(
@@ -96,46 +109,81 @@ contract RatchetVault is IRatchetVault, ReentrancyGuard {
         creator = creator_;
     }
 
-    /// @notice Initialize the token address (called by factory after token deployment)
+    /// @notice Initialize the token address and record starting balance
     /// @param token_ The token address this vault will hold
     function initialize(address token_) external {
         if (msg.sender != FACTORY) revert OnlyFactory();
         if (TOKEN != address(0)) revert AlreadyInitialized();
         if (token_ == address(0)) revert ZeroAddress();
         TOKEN = token_;
+        vaultStartingBalance = IERC20(token_).balanceOf(address(this));
     }
 
     /// @notice Called by hook when someone buys tokens. Sells a percentage into the buy.
     /// @param buyAmount The amount of tokens being bought
     /// @return sellAmount The amount of tokens sold from vault (transferred to hook)
     function onBuy(uint256 buyAmount) external onlyHook returns (uint256 sellAmount) {
-        if (reactiveSellRate == 0) return 0;
+        // 1. If vaultFinished or rate is 0, no sell
+        if (vaultFinished || reactiveSellRate == 0) return 0;
 
-        // Calculate reactive sell amount as percentage of buy
+        // 2. Check balance against shutoff reserve
+        uint256 balance = IERC20(TOKEN).balanceOf(address(this));
+        uint256 shutoffReserve =
+            (vaultStartingBalance * SHUTOFF_THRESHOLD_BPS) / BPS_DENOMINATOR;
+        if (balance <= shutoffReserve) {
+            vaultFinished = true;
+            emit VaultFinished(address(this));
+            return 0;
+        }
+
+        // 3. Reset daily counter if new day
+        uint256 today = block.timestamp / 1 days;
+        if (today != lastSellDay) {
+            lastSellDay = today;
+            dailySold = 0;
+        }
+
+        // 4. Calculate sell amount based on buy amount and rate
         sellAmount = (buyAmount * reactiveSellRate) / BPS_DENOMINATOR;
 
-        // Cap at available balance
-        uint256 balance = IERC20(TOKEN).balanceOf(address(this));
-        if (sellAmount > balance) {
-            sellAmount = balance;
+        // 5. Cap at per-trigger maximum: 0.1% of starting balance
+        uint256 maxTrigger =
+            (vaultStartingBalance * MAX_SELL_PER_TRIGGER_BPS) / BPS_DENOMINATOR;
+        if (sellAmount > maxTrigger) {
+            sellAmount = maxTrigger;
         }
 
-        // Per-block cumulative cap to limit flash-loan / split-buy extraction
-        if (block.number != lastSellBlock) {
-            lastSellBlock = block.number;
-            blockSellAmount = 0;
+        // 6. Cap at daily remaining: 0.135% of starting balance per day
+        uint256 maxDailyTotal =
+            (vaultStartingBalance * MAX_DAILY_RATE) / RATE_DENOMINATOR;
+        uint256 dailyRemaining = maxDailyTotal > dailySold ? maxDailyTotal - dailySold : 0;
+        if (sellAmount > dailyRemaining) {
+            sellAmount = dailyRemaining;
         }
-        uint256 blockStartBalance = balance + blockSellAmount;
-        uint256 maxBlockSell = (blockStartBalance * MAX_SELL_PER_BUY_BPS) / BPS_DENOMINATOR;
-        if (blockSellAmount + sellAmount > maxBlockSell) {
-            sellAmount = maxBlockSell > blockSellAmount ? maxBlockSell - blockSellAmount : 0;
-        }
-        blockSellAmount += sellAmount;
 
-        if (sellAmount > 0) {
-            IERC20(TOKEN).safeTransfer(HOOK, sellAmount);
-            emit ReactiveSell(msg.sender, buyAmount, sellAmount, reactiveSellRate);
+        // 7. Cap so balance doesn't go below shutoff reserve
+        uint256 maxForReserve = balance - shutoffReserve;
+        if (sellAmount > maxForReserve) {
+            sellAmount = maxForReserve;
         }
+
+        // 8. If nothing to sell, return 0
+        if (sellAmount == 0) return 0;
+
+        // 9. Update state
+        dailySold += sellAmount;
+        totalSold += sellAmount;
+        lastSellDay = today;
+
+        // 10. Check if remaining balance hits shutoff
+        if (balance - sellAmount <= shutoffReserve) {
+            vaultFinished = true;
+            emit VaultFinished(address(this));
+        }
+
+        // 11. Transfer and emit
+        IERC20(TOKEN).safeTransfer(HOOK, sellAmount);
+        emit ReactiveSell(msg.sender, buyAmount, sellAmount, reactiveSellRate);
 
         return sellAmount;
     }
@@ -152,18 +200,17 @@ contract RatchetVault is IRatchetVault, ReentrancyGuard {
         emit RatchetDecreased(oldRate, newRate);
     }
 
-    /// @notice Withdraw accumulated ETH fees to team recipient
-    function claimFees() external onlyTeam nonReentrant {
+    /// @notice Release remaining tokens to team after vault is finished
+    function releaseFinalTokens() external onlyTeam {
+        if (!vaultFinished) revert VaultNotFinished();
         if (!claimed) revert NotYetClaimed();
-        uint256 fees = accumulatedFees;
-        if (fees == 0) revert NoFeesToClaim();
 
-        accumulatedFees = 0;
+        uint256 balance = IERC20(TOKEN).balanceOf(address(this));
+        if (balance > 0) {
+            IERC20(TOKEN).safeTransfer(teamRecipient_, balance);
+        }
 
-        (bool success,) = teamRecipient_.call{value: fees}("");
-        require(success, "ETH transfer failed");
-
-        emit TeamFeeClaimed(teamRecipient_, fees);
+        emit FinalTokensReleased(teamRecipient_, balance);
     }
 
     /// @notice Set the vault as claimed with a new team recipient
@@ -196,12 +243,6 @@ contract RatchetVault is IRatchetVault, ReentrancyGuard {
         emit TeamTransferAccepted(teamRecipient_, msg.sender);
         teamRecipient_ = msg.sender;
         pendingTeamRecipient = address(0);
-    }
-
-    /// @notice Receive ETH fees from hook
-    receive() external payable {
-        if (msg.sender != HOOK) revert OnlyHook();
-        accumulatedFees += msg.value;
     }
 
     /// @notice Get the token address (legacy getter)
