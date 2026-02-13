@@ -85,6 +85,7 @@ contract RatchetFactory is IRatchetFactory, ReentrancyGuard {
     error TeamFeeShareTooHigh();
     error ZeroTotalSupply();
     error VaultNotDeployed();
+    error InvalidSqrtPrice();
 
     /// @notice Deploy the factory with a pre-deployed hook
     /// @dev The hook must be deployed at a mined address with correct permission flags.
@@ -204,12 +205,17 @@ contract RatchetFactory is IRatchetFactory, ReentrancyGuard {
         // Register pool with hook before initialization (include token position for buy detection)
         HOOK.registerPool(key, address(token), address(vault), tokenIsCurrency0, params.teamFeeShareBps);
 
+        // Validate sqrtPriceX96 is within Uniswap v4 bounds
+        if (params.initialSqrtPriceX96 < TickMath.MIN_SQRT_PRICE || params.initialSqrtPriceX96 > TickMath.MAX_SQRT_PRICE) {
+            revert InvalidSqrtPrice();
+        }
+
         // Correct sqrtPriceX96 for currency ordering.
         // The caller computes sqrtPriceX96 = sqrt(token/ETH) * 2^96 (assuming WETH is currency0).
         // When token < WETH, currencies are swapped so we need sqrt(ETH/token) * 2^96 = 2^192 / input.
         uint160 sqrtPriceX96 = params.initialSqrtPriceX96;
         if (tokenIsCurrency0) {
-            sqrtPriceX96 = uint160((uint256(1) << 192) / uint256(params.initialSqrtPriceX96));
+            sqrtPriceX96 = ((uint256(1) << 192) / uint256(params.initialSqrtPriceX96)).toUint160();
         }
 
         // Initialize pool at corrected price
