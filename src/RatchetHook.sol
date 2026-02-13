@@ -60,6 +60,10 @@ contract RatchetHook is BaseHook, IRatchetHook, IUnlockCallback, ReentrancyGuard
     uint256 public totalPoolEthFees;
     /// @notice Tracks tokens registered to pools (prevents accidental sweep)
     mapping(address => bool) public registeredTokens;
+    /// @notice ETH pending for vaults after failed transfers (bypasses protocol fee on retry)
+    mapping(address => uint256) public vaultPendingFees;
+    /// @notice Total vault pending fees (for sweep accounting)
+    uint256 public totalVaultPendingFees;
 
     error OnlyFactory();
     error OnlyProtocol();
@@ -262,9 +266,9 @@ contract RatchetHook is BaseHook, IRatchetHook, IUnlockCallback, ReentrancyGuard
         if (toTeam > 0) {
             (bool success,) = vault.call{value: toTeam}("");
             if (!success) {
-                // If vault transfer fails, return team share to pool fees for retry
-                poolEthFees[poolId] += toTeam;
-                totalPoolEthFees += toTeam;
+                // Store in vault-specific pending fees (bypasses protocol fee on retry)
+                vaultPendingFees[vault] += toTeam;
+                totalVaultPendingFees += toTeam;
             }
         }
 
@@ -306,9 +310,27 @@ contract RatchetHook is BaseHook, IRatchetHook, IUnlockCallback, ReentrancyGuard
         return "";
     }
 
+    /// @notice Retry sending pending ETH fees to a vault
+    /// @dev Bypasses protocol fee since these were already taxed. Anyone can call.
+    /// @param vault The vault to retry sending fees to
+    function retryVaultFees(address vault) external nonReentrant {
+        uint256 amount = vaultPendingFees[vault];
+        if (amount == 0) revert NoFeesToClaim();
+
+        vaultPendingFees[vault] = 0;
+        totalVaultPendingFees -= amount;
+
+        (bool success,) = vault.call{value: amount}("");
+        if (!success) {
+            // Still failing — put back for another retry
+            vaultPendingFees[vault] = amount;
+            totalVaultPendingFees += amount;
+        }
+    }
+
     /// @notice Claim accumulated protocol fees
     /// @dev Only callable by PROTOCOL_RECIPIENT. Transfers all accumulated protocol fees.
-    function claimProtocolFees() external onlyProtocol {
+    function claimProtocolFees() external onlyProtocol nonReentrant {
         uint256 amount = protocolFeesAccumulated;
         if (amount == 0) revert NoFeesToClaim();
         protocolFeesAccumulated = 0;
@@ -333,8 +355,8 @@ contract RatchetHook is BaseHook, IRatchetHook, IUnlockCallback, ReentrancyGuard
 
     /// @notice Sweep untracked ETH to protocol recipient
     /// @dev Recovers ETH sent directly to the hook without using depositFees
-    function sweepETH() external onlyProtocol {
-        uint256 tracked = protocolFeesAccumulated + totalPoolEthFees;
+    function sweepETH() external onlyProtocol nonReentrant {
+        uint256 tracked = protocolFeesAccumulated + totalPoolEthFees + totalVaultPendingFees;
         uint256 balance = address(this).balance;
         if (balance > tracked) {
             uint256 untracked = balance - tracked;

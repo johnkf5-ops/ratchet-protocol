@@ -10,6 +10,7 @@ import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 import {IPositionManager} from "@uniswap/v4-periphery/src/interfaces/IPositionManager.sol";
 import {Actions} from "@uniswap/v4-periphery/src/libraries/Actions.sol";
@@ -26,7 +27,7 @@ import {RatchetHook} from "./RatchetHook.sol";
 /// @notice One-click token launches with ratcheting team vaults
 /// @dev Deploys token + vault, creates Uniswap v4 pool, burns LP.
 ///      Team allocation sells reactively into buys at a rate that can only decrease.
-contract RatchetFactory is IRatchetFactory {
+contract RatchetFactory is IRatchetFactory, ReentrancyGuard {
     using PoolIdLibrary for PoolKey;
     using CurrencyLibrary for Currency;
     using SafeERC20 for IERC20;
@@ -128,7 +129,7 @@ contract RatchetFactory is IRatchetFactory {
     ///      Any unused ETH is refunded to the caller.
     /// @param params Launch configuration (name, symbol, supply, allocations, price)
     /// @return result Deployed addresses and pool ID
-    function launch(LaunchParams calldata params) external payable returns (LaunchResult memory result) {
+    function launch(LaunchParams calldata params) external payable nonReentrant returns (LaunchResult memory result) {
         if (params.totalSupply == 0) revert ZeroTotalSupply();
         if (params.totalSupply > MAX_TOTAL_SUPPLY) revert TotalSupplyTooHigh();
         if (params.teamAllocationBps > MAX_TEAM_ALLOCATION) revert TeamAllocationTooHigh();
@@ -208,6 +209,15 @@ contract RatchetFactory is IRatchetFactory {
 
         // Add liquidity and burn LP position
         _addInitialLiquidity(key, lpSupply, params.initialSqrtPriceX96);
+
+        // Refund leftover tokens to launcher (position may not use all lpSupply)
+        uint256 remainingTokens = IERC20(address(token)).balanceOf(address(this));
+        if (remainingTokens > 0) {
+            IERC20(address(token)).safeTransfer(msg.sender, remainingTokens);
+        }
+
+        // Revoke Permit2 approval for this token (no longer needed after liquidity)
+        IERC20(address(token)).approve(address(PERMIT2), 0);
 
         result = LaunchResult({
             token: address(token),

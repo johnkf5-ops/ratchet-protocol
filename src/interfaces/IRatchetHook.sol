@@ -41,6 +41,15 @@ interface IRatchetHook {
     /// @notice Accept the protocol recipient role (second step of two-step transfer)
     function acceptProtocolTransfer() external;
 
+    /// @notice Retry sending pending ETH fees to a vault (bypasses protocol fee)
+    function retryVaultFees(address vault) external;
+
+    /// @notice Pending ETH fees for a vault after failed transfers
+    function vaultPendingFees(address vault) external view returns (uint256);
+
+    /// @notice Total vault pending fees across all vaults
+    function totalVaultPendingFees() external view returns (uint256);
+
     /// @notice Fee share to team in basis points for a specific pool
     function poolTeamFeeShare(bytes32 poolId) external view returns (uint256);
 
